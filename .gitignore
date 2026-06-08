@@ -1,0 +1,22 @@
+# Runtime artifacts
+*.log
+*.done
+pppoe_codex_active_state.json
+
+# Local network/proxy backups
+backups/
+clash-verge.before-tun.*.yaml
+clash-verge.current.*.yaml
+verge.current.*.yaml
+
+# Temporary files and caches
+*.tmp
+*.bak
+.cache/
+__pycache__/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
