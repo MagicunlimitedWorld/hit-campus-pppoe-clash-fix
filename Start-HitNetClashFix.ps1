@@ -360,142 +360,173 @@ Add-Type -AssemblyName System.Drawing
 $settings = Get-AppSettings
 
 $form = [System.Windows.Forms.Form]::new()
-$form.Text = "HIT 校园网 PPPoE + Clash 一键连接"
+$form.Text = "HIT PPPoE + Clash 代理修复"
 $form.StartPosition = "CenterScreen"
-$form.Size = [System.Drawing.Size]::new(760, 660)
-$form.MinimumSize = [System.Drawing.Size]::new(760, 660)
+$form.Size = [System.Drawing.Size]::new(760, 700)
+$form.MinimumSize = [System.Drawing.Size]::new(760, 700)
 $form.Font = [System.Drawing.Font]::new("Microsoft YaHei UI", 9)
+
+$titleLabel = [System.Windows.Forms.Label]::new()
+$titleLabel.AutoSize = $false
+$titleLabel.Location = [System.Drawing.Point]::new(20, 14)
+$titleLabel.Size = [System.Drawing.Size]::new(700, 28)
+$titleLabel.Font = [System.Drawing.Font]::new("Microsoft YaHei UI", 13, [System.Drawing.FontStyle]::Bold)
+$titleLabel.Text = "修复 PPPoE 拨号后 Clash 代理不可用"
+$form.Controls.Add($titleLabel)
+
+$subtitleLabel = [System.Windows.Forms.Label]::new()
+$subtitleLabel.AutoSize = $false
+$subtitleLabel.Location = [System.Drawing.Point]::new(22, 44)
+$subtitleLabel.Size = [System.Drawing.Size]::new(700, 22)
+$subtitleLabel.Text = "输入校园网账号后，一键连接有线 PPPoE 并保持 Clash 代理可用。"
+$form.Controls.Add($subtitleLabel)
 
 $statusLabel = [System.Windows.Forms.Label]::new()
 $statusLabel.AutoSize = $false
-$statusLabel.Location = [System.Drawing.Point]::new(18, 16)
+$statusLabel.Location = [System.Drawing.Point]::new(22, 70)
 $statusLabel.Size = [System.Drawing.Size]::new(700, 24)
 $statusLabel.Text = Get-StateSummary
 $form.Controls.Add($statusLabel)
 
+$loginGroup = [System.Windows.Forms.GroupBox]::new()
+$loginGroup.Location = [System.Drawing.Point]::new(20, 102)
+$loginGroup.Size = [System.Drawing.Size]::new(700, 96)
+$loginGroup.Text = "校园网登录"
+$form.Controls.Add($loginGroup)
+
+$advancedGroup = [System.Windows.Forms.GroupBox]::new()
+$advancedGroup.Location = [System.Drawing.Point]::new(20, 210)
+$advancedGroup.Size = [System.Drawing.Size]::new(700, 124)
+$advancedGroup.Text = "高级配置"
+$form.Controls.Add($advancedGroup)
+
 $accountLabel = [System.Windows.Forms.Label]::new()
-$accountLabel.Location = [System.Drawing.Point]::new(20, 52)
+$accountLabel.Location = [System.Drawing.Point]::new(18, 30)
 $accountLabel.Size = [System.Drawing.Size]::new(90, 24)
 $accountLabel.Text = "校园网账号"
-$form.Controls.Add($accountLabel)
+$loginGroup.Controls.Add($accountLabel)
 
 $accountBox = [System.Windows.Forms.TextBox]::new()
-$accountBox.Location = [System.Drawing.Point]::new(118, 49)
+$accountBox.Location = [System.Drawing.Point]::new(108, 27)
 $accountBox.Size = [System.Drawing.Size]::new(250, 24)
 $accountBox.Text = if ($settings.RememberAccount) { $settings.Account } else { "" }
-$form.Controls.Add($accountBox)
+$loginGroup.Controls.Add($accountBox)
 
 $rememberAccountBox = [System.Windows.Forms.CheckBox]::new()
-$rememberAccountBox.Location = [System.Drawing.Point]::new(385, 49)
+$rememberAccountBox.Location = [System.Drawing.Point]::new(378, 27)
 $rememberAccountBox.Size = [System.Drawing.Size]::new(120, 24)
 $rememberAccountBox.Text = "记住账号"
 $rememberAccountBox.Checked = [bool]$settings.RememberAccount
-$form.Controls.Add($rememberAccountBox)
+$loginGroup.Controls.Add($rememberAccountBox)
 
 $passwordLabel = [System.Windows.Forms.Label]::new()
-$passwordLabel.Location = [System.Drawing.Point]::new(20, 84)
+$passwordLabel.Location = [System.Drawing.Point]::new(18, 62)
 $passwordLabel.Size = [System.Drawing.Size]::new(90, 24)
 $passwordLabel.Text = "校园网密码"
-$form.Controls.Add($passwordLabel)
+$loginGroup.Controls.Add($passwordLabel)
 
 $passwordBox = [System.Windows.Forms.TextBox]::new()
-$passwordBox.Location = [System.Drawing.Point]::new(118, 81)
+$passwordBox.Location = [System.Drawing.Point]::new(108, 59)
 $passwordBox.Size = [System.Drawing.Size]::new(250, 24)
 $passwordBox.UseSystemPasswordChar = $true
 if ($settings.RememberPassword) {
     $passwordBox.Text = ConvertTo-PlainTextFromProtectedText -ProtectedText $settings.PasswordProtected
 }
-$form.Controls.Add($passwordBox)
+$loginGroup.Controls.Add($passwordBox)
 
 $rememberPasswordBox = [System.Windows.Forms.CheckBox]::new()
-$rememberPasswordBox.Location = [System.Drawing.Point]::new(385, 81)
+$rememberPasswordBox.Location = [System.Drawing.Point]::new(378, 59)
 $rememberPasswordBox.Size = [System.Drawing.Size]::new(120, 24)
 $rememberPasswordBox.Text = "记住密码"
 $rememberPasswordBox.Checked = [bool]$settings.RememberPassword
-$form.Controls.Add($rememberPasswordBox)
-
-$pppoeLabel = [System.Windows.Forms.Label]::new()
-$pppoeLabel.Location = [System.Drawing.Point]::new(20, 122)
-$pppoeLabel.Size = [System.Drawing.Size]::new(90, 24)
-$pppoeLabel.Text = "PPPoE 名称"
-$form.Controls.Add($pppoeLabel)
-
-$script:RasEntryBox = [System.Windows.Forms.TextBox]::new()
-$script:RasEntryBox.Location = [System.Drawing.Point]::new(118, 119)
-$script:RasEntryBox.Size = [System.Drawing.Size]::new(250, 24)
-$script:RasEntryBox.Text = $settings.RasEntry
-$form.Controls.Add($script:RasEntryBox)
-
-$proxyLabel = [System.Windows.Forms.Label]::new()
-$proxyLabel.Location = [System.Drawing.Point]::new(20, 154)
-$proxyLabel.Size = [System.Drawing.Size]::new(90, 24)
-$proxyLabel.Text = "代理地址"
-$form.Controls.Add($proxyLabel)
-
-$script:ProxyUrlBox = [System.Windows.Forms.TextBox]::new()
-$script:ProxyUrlBox.Location = [System.Drawing.Point]::new(118, 151)
-$script:ProxyUrlBox.Size = [System.Drawing.Size]::new(250, 24)
-$script:ProxyUrlBox.Text = $settings.ProxyUrl
-$form.Controls.Add($script:ProxyUrlBox)
-
-$tunLabel = [System.Windows.Forms.Label]::new()
-$tunLabel.Location = [System.Drawing.Point]::new(385, 122)
-$tunLabel.Size = [System.Drawing.Size]::new(90, 24)
-$tunLabel.Text = "TUN 网卡"
-$form.Controls.Add($tunLabel)
-
-$script:TunAliasBox = [System.Windows.Forms.TextBox]::new()
-$script:TunAliasBox.Location = [System.Drawing.Point]::new(475, 119)
-$script:TunAliasBox.Size = [System.Drawing.Size]::new(210, 24)
-$script:TunAliasBox.Text = $settings.TunInterfaceAlias
-$form.Controls.Add($script:TunAliasBox)
+$loginGroup.Controls.Add($rememberPasswordBox)
 
 $autoCloseBox = [System.Windows.Forms.CheckBox]::new()
-$autoCloseBox.Location = [System.Drawing.Point]::new(385, 151)
+$autoCloseBox.Location = [System.Drawing.Point]::new(510, 43)
 $autoCloseBox.Size = [System.Drawing.Size]::new(150, 24)
 $autoCloseBox.Text = "成功后自动关闭"
 $autoCloseBox.Checked = [bool]$settings.AutoCloseOnSuccess
-$form.Controls.Add($autoCloseBox)
+$loginGroup.Controls.Add($autoCloseBox)
+
+$pppoeLabel = [System.Windows.Forms.Label]::new()
+$pppoeLabel.Location = [System.Drawing.Point]::new(18, 30)
+$pppoeLabel.Size = [System.Drawing.Size]::new(90, 24)
+$pppoeLabel.Text = "PPPoE 名称"
+$advancedGroup.Controls.Add($pppoeLabel)
+
+$script:RasEntryBox = [System.Windows.Forms.TextBox]::new()
+$script:RasEntryBox.Location = [System.Drawing.Point]::new(108, 27)
+$script:RasEntryBox.Size = [System.Drawing.Size]::new(250, 24)
+$script:RasEntryBox.Text = $settings.RasEntry
+$advancedGroup.Controls.Add($script:RasEntryBox)
+
+$proxyLabel = [System.Windows.Forms.Label]::new()
+$proxyLabel.Location = [System.Drawing.Point]::new(18, 62)
+$proxyLabel.Size = [System.Drawing.Size]::new(90, 24)
+$proxyLabel.Text = "代理地址"
+$advancedGroup.Controls.Add($proxyLabel)
+
+$script:ProxyUrlBox = [System.Windows.Forms.TextBox]::new()
+$script:ProxyUrlBox.Location = [System.Drawing.Point]::new(108, 59)
+$script:ProxyUrlBox.Size = [System.Drawing.Size]::new(250, 24)
+$script:ProxyUrlBox.Text = $settings.ProxyUrl
+$advancedGroup.Controls.Add($script:ProxyUrlBox)
+
+$tunLabel = [System.Windows.Forms.Label]::new()
+$tunLabel.Location = [System.Drawing.Point]::new(378, 30)
+$tunLabel.Size = [System.Drawing.Size]::new(90, 24)
+$tunLabel.Text = "TUN 网卡"
+$advancedGroup.Controls.Add($tunLabel)
+
+$script:TunAliasBox = [System.Windows.Forms.TextBox]::new()
+$script:TunAliasBox.Location = [System.Drawing.Point]::new(468, 27)
+$script:TunAliasBox.Size = [System.Drawing.Size]::new(200, 24)
+$script:TunAliasBox.Text = $settings.TunInterfaceAlias
+$advancedGroup.Controls.Add($script:TunAliasBox)
 
 $clashPathLabel = [System.Windows.Forms.Label]::new()
-$clashPathLabel.Location = [System.Drawing.Point]::new(20, 188)
+$clashPathLabel.Location = [System.Drawing.Point]::new(18, 94)
 $clashPathLabel.Size = [System.Drawing.Size]::new(90, 24)
 $clashPathLabel.Text = "Clash 路径"
-$form.Controls.Add($clashPathLabel)
+$advancedGroup.Controls.Add($clashPathLabel)
 
 $script:ClashPathBox = [System.Windows.Forms.TextBox]::new()
-$script:ClashPathBox.Location = [System.Drawing.Point]::new(118, 185)
-$script:ClashPathBox.Size = [System.Drawing.Size]::new(500, 24)
+$script:ClashPathBox.Location = [System.Drawing.Point]::new(108, 91)
+$script:ClashPathBox.Size = [System.Drawing.Size]::new(468, 24)
 $script:ClashPathBox.Text = $settings.ClashPath
-$form.Controls.Add($script:ClashPathBox)
+$advancedGroup.Controls.Add($script:ClashPathBox)
 
 $browseButton = [System.Windows.Forms.Button]::new()
-$browseButton.Location = [System.Drawing.Point]::new(630, 183)
+$browseButton.Location = [System.Drawing.Point]::new(588, 89)
 $browseButton.Size = [System.Drawing.Size]::new(80, 28)
 $browseButton.Text = "浏览"
-$form.Controls.Add($browseButton)
+$advancedGroup.Controls.Add($browseButton)
 
 $refreshButton = [System.Windows.Forms.Button]::new()
-$refreshButton.Location = [System.Drawing.Point]::new(20, 226)
+$refreshButton.Location = [System.Drawing.Point]::new(20, 350)
 $refreshButton.Size = [System.Drawing.Size]::new(90, 36)
 $refreshButton.Text = "刷新状态"
 $form.Controls.Add($refreshButton)
 
 $connectButton = [System.Windows.Forms.Button]::new()
-$connectButton.Location = [System.Drawing.Point]::new(128, 226)
-$connectButton.Size = [System.Drawing.Size]::new(240, 36)
-$connectButton.Text = "一键连接有线网 + Clash"
+$connectButton.Location = [System.Drawing.Point]::new(128, 350)
+$connectButton.Size = [System.Drawing.Size]::new(260, 36)
+$connectButton.Text = "一键修复并连接有线 PPPoE"
+$connectButton.BackColor = [System.Drawing.SystemColors]::Highlight
+$connectButton.ForeColor = [System.Drawing.Color]::White
+$connectButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$connectButton.UseVisualStyleBackColor = $false
 $form.Controls.Add($connectButton)
 
 $restoreButton = [System.Windows.Forms.Button]::new()
-$restoreButton.Location = [System.Drawing.Point]::new(390, 226)
+$restoreButton.Location = [System.Drawing.Point]::new(408, 350)
 $restoreButton.Size = [System.Drawing.Size]::new(190, 36)
 $restoreButton.Text = "一键切换回 WLAN"
 $form.Controls.Add($restoreButton)
 
 $outputBox = [System.Windows.Forms.TextBox]::new()
-$outputBox.Location = [System.Drawing.Point]::new(20, 282)
-$outputBox.Size = [System.Drawing.Size]::new(700, 290)
+$outputBox.Location = [System.Drawing.Point]::new(20, 404)
+$outputBox.Size = [System.Drawing.Size]::new(700, 208)
 $outputBox.Multiline = $true
 $outputBox.ScrollBars = "Vertical"
 $outputBox.ReadOnly = $true
@@ -503,9 +534,9 @@ $outputBox.WordWrap = $false
 $form.Controls.Add($outputBox)
 
 $hintLabel = [System.Windows.Forms.Label]::new()
-$hintLabel.Location = [System.Drawing.Point]::new(20, 586)
+$hintLabel.Location = [System.Drawing.Point]::new(20, 626)
 $hintLabel.Size = [System.Drawing.Size]::new(700, 32)
-$hintLabel.Text = "主流程不要求先连接 WLAN；请先插好有线并确保 Clash TUN 已开启。默认成功后窗口保持打开。"
+$hintLabel.Text = "不要求先连接 WLAN；请插好有线并确保 Clash TUN 已开启。默认成功后窗口保持打开。"
 $form.Controls.Add($hintLabel)
 
 $script:CurrentJob = $null
@@ -555,9 +586,9 @@ function Start-BackendJob {
     $script:CloseAfterSuccess = $false
     $script:SuccessSeenAt = $null
     $script:LastJobOutputText = ""
-    $statusLabel.Text = if ($Action -eq "connect") { "正在一键连接有线网 + Clash..." } else { "正在切换回 WLAN..." }
+    $statusLabel.Text = if ($Action -eq "connect") { "正在修复并连接有线 PPPoE..." } else { "正在切换回 WLAN..." }
     $outputBox.Clear()
-    Append-Output ("=== {0} {1} ===" -f ($(if ($Action -eq "connect") { "一键连接有线网 + Clash" } else { "切换回 WLAN" }), (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
+    Append-Output ("=== {0} {1} ===" -f ($(if ($Action -eq "connect") { "修复并连接有线 PPPoE" } else { "切换回 WLAN" }), (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
     Append-Output ("脚本: {0}" -f $(if ($Action -eq "connect") { $EnterScript } else { $RestoreScript }))
     Append-Output ("日志目录: {0}" -f $RuntimeLogDir)
     Append-Output ("PPPoE={0} Proxy={1} TUN={2} ClashPath={3}" -f $cfg.RasEntry, $cfg.ProxyUrl, $cfg.TunInterfaceAlias, $cfg.ClashPath)
@@ -663,7 +694,7 @@ $timer.Add_Tick({
             }
         }
         else {
-            $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "正在一键连接有线网 + Clash..." } else { "正在切换回 WLAN..." }
+            $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "正在修复并连接有线 PPPoE..." } else { "正在切换回 WLAN..." }
         }
     }
     elseif ($script:CloseAfterSuccess -and $null -ne $script:SuccessSeenAt) {

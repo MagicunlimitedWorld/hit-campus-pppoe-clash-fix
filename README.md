@@ -1,8 +1,8 @@
-# HIT 校园网 PPPoE + Clash 一键修复工具
+# HIT 校园网 PPPoE + Clash 代理修复工具
 
-这个仓库用于解决 HIT 校园网 PPPoE 拨号上网后，Clash Verge/mihomo、Codex 或 OpenAI 无法正常走代理的问题。
+这个仓库用于解决 HIT 校园网 PPPoE 拨号连接后，Clash Verge/mihomo 代理无法正常使用的问题。
 
-主流程是：电脑开机后插好有线网，打开工具，一键启动/等待 Clash，然后拨号进入“有线 PPPoE + Clash”环境。WLAN 只是回退路径，不是进入有线环境的前提。
+主流程是：电脑开机后插好有线网，打开工具，一键启动/等待 Clash，并完成 PPPoE 拨号与代理修复。WLAN 只是回退路径，不是进入有线环境的前提。
 
 ## 适用环境
 
@@ -20,12 +20,12 @@
 Start-HitNetClashFix.cmd
 ```
 
-连接有线 PPPoE + Clash：
+修复并连接有线 PPPoE：
 
 1. 插好有线网，确认以太网适配器为已连接。
 2. 输入校园网账号和密码。
 3. 首次使用时检查 PPPoE 名称、代理地址、TUN 网卡名、Clash 路径。
-4. 点击“一键连接有线网 + Clash”。
+4. 点击“一键修复并连接有线 PPPoE”。
 
 切换回 WLAN：
 
@@ -52,7 +52,7 @@ Start-HitNetClashFix.cmd
 - `Start-HitNetClashFix.ps1`：可视化界面。
 - `HitNetClashConfig.ps1`：共享配置读取与自动探测逻辑。
 - `config.example.json`：公开模板配置。
-- `enter_pppoe_codex.ps1`：一键进入有线 PPPoE + Clash。
+- `enter_pppoe_codex.ps1`：一键修复并连接有线 PPPoE + Clash。
 - `restore_wlan_clash.ps1`：恢复 WLAN + Clash。
 - `diagnostics/pppoe_clash_test_and_restore.ps1`：诊断和受控测试脚本。
 
@@ -66,7 +66,7 @@ Start-HitNetClashFix.cmd
 
 ## 高级命令行用法
 
-连接有线 PPPoE + Clash：
+修复并连接有线 PPPoE + Clash：
 
 ```powershell
 .\enter_pppoe_codex.ps1
@@ -86,7 +86,7 @@ curl.exe --max-time 10 -I -L --proxy http://127.0.0.1:7897 https://api.openai.co
 Resolve-DnsName api.openai.com -Type A -DnsOnly
 ```
 
-连接成功后，`api.openai.com` 通常会解析到 `198.18.x.x`，OpenAI direct/proxy 均应返回 `401`。
+连接成功后，`api.openai.com` 通常会解析到 `198.18.x.x`，可用作 Clash 代理链路验证。
 
 ## 故障处理
 
