@@ -1,0 +1,29 @@
+{
+  "RasEntry": "HITnet",
+  "ProxyUrl": "http://127.0.0.1:7897",
+  "TunInterfaceAlias": "Meta",
+  "TunIpv4Gateway": "198.18.0.2",
+  "TunIpv6Gateway": "fdfe:dcba:9876::2",
+  "ClashProcessName": "clash-verge",
+  "ClashCoreProcessName": "verge-mihomo",
+  "ClashExecutableCandidates": [
+    "%LOCALAPPDATA%\\Programs\\Clash Verge\\clash-verge.exe",
+    "%LOCALAPPDATA%\\Programs\\Clash Verge Rev\\clash-verge.exe",
+    "%PROGRAMFILES%\\Clash Verge\\clash-verge.exe",
+    "%PROGRAMFILES%\\Clash Verge Rev\\clash-verge.exe",
+    "D:\\clash verge\\clash-verge.exe"
+  ],
+  "NrptNamespaces": [
+    ".openai.com",
+    ".chatgpt.com",
+    ".oaistatic.com",
+    ".oaiusercontent.com",
+    ".github.com"
+  ],
+  "EthernetNamePatterns": [
+    "Ethernet",
+    "以太网",
+    "Realtek PCIe",
+    "Intel(R) Ethernet"
+  ]
+}

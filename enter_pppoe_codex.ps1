@@ -1,8 +1,13 @@
-param(
-    [string]$RasEntry = "HITnet",
+﻿param(
+    [string]$RasEntry,
     [string]$Username,
     [pscredential]$Credential,
-    [string]$ProxyUrl = "http://127.0.0.1:7897",
+    [string]$ProxyUrl,
+    [string]$TunInterfaceAlias,
+    [string]$TunIpv4Gateway,
+    [string]$TunIpv6Gateway,
+    [string]$ClashPath,
+    [string]$SettingsPath,
     [int]$WatchdogTimeoutSeconds = 180,
     [int]$ConnectAttempts = 2,
     [int]$ConnectRetryDelaySeconds = 10,
@@ -12,6 +17,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+if (-not (Test-Path -LiteralPath $ConfigScript)) {
+    throw "Config helper not found: $ConfigScript"
+}
+. $ConfigScript
+$Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -ClashPath $ClashPath
+$RasEntry = $Config.RasEntry
+$ProxyUrl = $Config.ProxyUrl
+$TunInterfaceAlias = $Config.TunInterfaceAlias
+$TunIpv4Gateway = $Config.TunIpv4Gateway
+$TunIpv6Gateway = $Config.TunIpv6Gateway
+$ClashPath = $Config.ClashPath
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
@@ -28,7 +45,7 @@ $WatchdogLogPath = Join-Path $RuntimeLogDir ("enter_pppoe_codex_watchdog_{0}.log
 $StatePath = Join-Path $RuntimeStateDir "pppoe_codex_active_state.json"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
 
-$NrptNamespaces = @(".openai.com", ".chatgpt.com", ".oaistatic.com", ".oaiusercontent.com", ".github.com")
+$NrptNamespaces = @($Config.NrptNamespaces)
 $NrptComment = "CodexClashEnter temporary NRPT rule $Timestamp"
 $CreatedNrptRuleNames = New-Object System.Collections.Generic.List[string]
 $AddedRoutes = New-Object System.Collections.Generic.List[object]
@@ -127,6 +144,10 @@ function Start-RestoreWatchdog {
     $escapedLog = $WatchdogLogPath.Replace("'", "''")
     $escapedRestore = $RestoreScript.Replace("'", "''")
     $escapedRasEntry = $RasEntry.Replace("'", "''")
+    $escapedProxyUrl = $ProxyUrl.Replace("'", "''")
+    $escapedTunAlias = $TunInterfaceAlias.Replace("'", "''")
+    $escapedTunV4 = $TunIpv4Gateway.Replace("'", "''")
+    $escapedTunV6 = $TunIpv6Gateway.Replace("'", "''")
     $timeout = [Math]::Max(30, $WatchdogTimeoutSeconds)
 
     $watchdogScript = @"
@@ -135,6 +156,10 @@ function Start-RestoreWatchdog {
 `$log = '$escapedLog'
 `$restore = '$escapedRestore'
 `$ras = '$escapedRasEntry'
+`$proxy = '$escapedProxyUrl'
+`$tun = '$escapedTunAlias'
+`$tunV4 = '$escapedTunV4'
+`$tunV6 = '$escapedTunV6'
 function Add-WatchdogLog([string]`$m) { Add-Content -LiteralPath `$log -Value ((Get-Date -Format 'yyyy-MM-ddTHH:mm:ss') + ' ' + `$m) }
 Add-WatchdogLog 'watchdog started; timeout=${timeout}s'
 for (`$i = 0; `$i -lt $([Math]::Ceiling($timeout / 5)); `$i++) {
@@ -142,7 +167,7 @@ for (`$i = 0; `$i -lt $([Math]::Ceiling($timeout / 5)); `$i++) {
     Start-Sleep -Seconds 5
 }
 Add-WatchdogLog 'timeout reached; running restore script'
-& `$restore -RasEntry `$ras -SkipProbe -Reason 'enter watchdog timeout' 2>&1 | Add-Content -LiteralPath `$log
+& `$restore -RasEntry `$ras -ProxyUrl `$proxy -TunInterfaceAlias `$tun -TunIpv4Gateway `$tunV4 -TunIpv6Gateway `$tunV6 -SkipProbe -Reason 'enter watchdog timeout' 2>&1 | Add-Content -LiteralPath `$log
 "@
 
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($watchdogScript))
@@ -161,8 +186,108 @@ function PreRestore {
     }
 
     Invoke-Logged "pre-restore stale Codex networking changes" {
-        & $RestoreScript -RasEntry $RasEntry -SkipProbe -Reason "enter pre-clean"
+        & $RestoreScript -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -SkipProbe -Reason "enter pre-clean"
     }
+}
+
+function Test-ProxyPortListening {
+    try {
+        $uri = [Uri]$ProxyUrl
+        $listeners = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -in @($uri.Host, "127.0.0.1", "0.0.0.0", "::", "::1") }
+        return [bool]$listeners
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-EthernetLinkReady {
+    Invoke-Logged "Ethernet link precheck" {
+        $adapters = Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Status -eq "Up" -and
+                $_.Name -ne $TunInterfaceAlias -and
+                $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth" -and
+                $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
+            } |
+            Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex
+
+        if ($adapters) {
+            $adapters | Format-Table -AutoSize
+        }
+        else {
+            "No Up Ethernet-like adapter detected."
+        }
+    }
+
+    $ready = Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Status -eq "Up" -and
+            $_.Name -ne $TunInterfaceAlias -and
+            $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth" -and
+            $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
+        } |
+        Select-Object -First 1
+
+    if (-not $ready) {
+        throw "Ethernet link is not ready. Plug in the cable/fiber uplink and confirm the Ethernet adapter is Up before dialing PPPoE."
+    }
+}
+
+function Ensure-ClashStarted {
+    $existing = Get-Process -Name $Config.ClashProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($existing) {
+        Write-Log ("Clash UI process already running: {0} PID={1}" -f $Config.ClashProcessName, $existing.Id)
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ClashPath) -or -not (Test-Path -LiteralPath $ClashPath)) {
+        throw "Clash executable not found. Configure ClashPath in the UI or .local/settings.json. Current value: $ClashPath"
+    }
+
+    Write-Log ("Starting Clash UI: {0}" -f $ClashPath)
+    Start-Process -FilePath $ClashPath -WindowStyle Hidden | Out-Null
+}
+
+function Wait-ClashLocalReady {
+    param([int]$TimeoutSeconds = 45)
+
+    Ensure-ClashStarted
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-ProxyPortListening) {
+            Write-Log ("Clash proxy is listening at {0}." -f $ProxyUrl)
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    throw "Clash proxy did not listen at $ProxyUrl within ${TimeoutSeconds}s. Confirm Clash Verge is running and mixed/http proxy is enabled."
+}
+
+function Wait-TunInterfaceReady {
+    param([int]$TimeoutSeconds = 45)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $adapter = Get-NetAdapter -Name $TunInterfaceAlias -ErrorAction SilentlyContinue
+        if ($adapter -and $adapter.Status -eq "Up") {
+            Write-Log ("TUN interface is ready: {0} ifIndex={1}" -f $adapter.Name, $adapter.ifIndex)
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    throw "TUN interface '$TunInterfaceAlias' is not Up. Enable Clash TUN/Meta in Clash Verge first; this script will not modify Clash config."
+}
+
+function Initialize-ColdStartPrerequisites {
+    Write-Log "=== cold-start local prerequisites ==="
+    Write-Log ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2} ClashPath={3}" -f $RasEntry, $ProxyUrl, $TunInterfaceAlias, $ClashPath)
+    Assert-EthernetLinkReady
+    Wait-ClashLocalReady
+    Wait-TunInterfaceReady
 }
 
 function Connect-Ras {
@@ -281,13 +406,16 @@ function Add-EnterSplitRoutes {
             Format-Table -AutoSize
     }
 
-    $metaV4 = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceAlias "Meta" -ErrorAction Stop | Select-Object -First 1
-    $metaV6 = Get-NetRoute -DestinationPrefix "::/0" -InterfaceAlias "Meta" -ErrorAction Stop | Select-Object -First 1
+    $tunAdapter = Get-NetAdapter -Name $TunInterfaceAlias -ErrorAction Stop | Select-Object -First 1
+    $metaV4 = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceAlias $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    $metaV6 = Get-NetRoute -DestinationPrefix "::/0" -InterfaceAlias $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    $v4NextHop = if ($metaV4 -and -not [string]::IsNullOrWhiteSpace($metaV4.NextHop)) { $metaV4.NextHop } else { $TunIpv4Gateway }
+    $v6NextHop = if ($metaV6 -and -not [string]::IsNullOrWhiteSpace($metaV6.NextHop)) { $metaV6.NextHop } else { $TunIpv6Gateway }
 
-    Add-SplitRoute -DestinationPrefix "0.0.0.0/1" -InterfaceIndex $metaV4.ifIndex -NextHop $metaV4.NextHop -AddressFamily "IPv4"
-    Add-SplitRoute -DestinationPrefix "128.0.0.0/1" -InterfaceIndex $metaV4.ifIndex -NextHop $metaV4.NextHop -AddressFamily "IPv4"
-    Add-SplitRoute -DestinationPrefix "::/1" -InterfaceIndex $metaV6.ifIndex -NextHop $metaV6.NextHop -AddressFamily "IPv6"
-    Add-SplitRoute -DestinationPrefix "8000::/1" -InterfaceIndex $metaV6.ifIndex -NextHop $metaV6.NextHop -AddressFamily "IPv6"
+    Add-SplitRoute -DestinationPrefix "0.0.0.0/1" -InterfaceIndex $tunAdapter.ifIndex -NextHop $v4NextHop -AddressFamily "IPv4"
+    Add-SplitRoute -DestinationPrefix "128.0.0.0/1" -InterfaceIndex $tunAdapter.ifIndex -NextHop $v4NextHop -AddressFamily "IPv4"
+    Add-SplitRoute -DestinationPrefix "::/1" -InterfaceIndex $tunAdapter.ifIndex -NextHop $v6NextHop -AddressFamily "IPv6"
+    Add-SplitRoute -DestinationPrefix "8000::/1" -InterfaceIndex $tunAdapter.ifIndex -NextHop $v6NextHop -AddressFamily "IPv6"
 
     Invoke-Logged "routes after enter split routes" {
         Get-NetRoute -DestinationPrefix "0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
@@ -315,6 +443,10 @@ function Save-State {
         NrptComment = $NrptComment
         NrptRuleNames = $nrptNames
         Routes = $routes
+        TunInterfaceAlias = $TunInterfaceAlias
+        TunIpv4Gateway = $TunIpv4Gateway
+        TunIpv6Gateway = $TunIpv6Gateway
+        ProxyUrl = $ProxyUrl
     }
     $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
 }
@@ -324,7 +456,7 @@ function Test-EnterConnectivity {
         & rasdial.exe
     }
     Invoke-Logged "Clash listen after enter changes" {
-        $proc = Get-Process verge-mihomo -ErrorAction SilentlyContinue | Select-Object -First 1
+        $proc = Get-Process -Name $Config.ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($proc) {
             $proc | Select-Object Id, ProcessName, Path | Format-List
             Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
@@ -333,7 +465,7 @@ function Test-EnterConnectivity {
                 Format-Table -AutoSize
         }
         else {
-            "verge-mihomo not found"
+            "$($Config.ClashCoreProcessName) not found"
         }
     }
     Invoke-Logged "targeted DNS after enter changes" {
@@ -372,7 +504,7 @@ function Test-EnterConnectivity {
 
 function Restore-OnFailure {
     if (Test-Path -LiteralPath $RestoreScript) {
-        & $RestoreScript -RasEntry $RasEntry -Reason "enter failure rollback" 2>&1 | Tee-Object -FilePath $LogPath -Append
+        & $RestoreScript -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -SkipProbe -Reason "enter failure rollback" 2>&1 | Tee-Object -FilePath $LogPath -Append
     }
 }
 
@@ -386,6 +518,7 @@ try {
     Write-Log ("WatchdogLogPath={0}" -f $WatchdogLogPath)
 
     PreRestore
+    Initialize-ColdStartPrerequisites
     $cred = Get-CredentialForRas
     Connect-Ras -Cred $cred
     Add-EnterNrptRules

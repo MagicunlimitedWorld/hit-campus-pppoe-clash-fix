@@ -1,6 +1,10 @@
-param(
-    [string]$RasEntry = "HITnet",
-    [string]$ProxyUrl = "http://127.0.0.1:7897",
+﻿param(
+    [string]$RasEntry,
+    [string]$ProxyUrl,
+    [string]$TunInterfaceAlias,
+    [string]$TunIpv4Gateway,
+    [string]$TunIpv6Gateway,
+    [string]$SettingsPath,
     [int]$EthernetIfIndex = 17,
     [int]$WifiIfIndex = 8,
     [switch]$RunDownloadTest,
@@ -14,10 +18,10 @@ param(
     [switch]$TrialIpv6SplitRoute,
     [string]$GithubDownloadUrl = "https://github.com/microsoft/vscode/archive/refs/heads/main.zip",
     [long]$GithubMaxBytes = 52428800,
-    [string]$WinHttpProxyServer = "127.0.0.1:7897",
+    [string]$WinHttpProxyServer,
     [string]$UserProxyBypass = "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>",
     [string]$ClashHome = (Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"),
-    [string]$ClashCoreExe = "D:\clash verge\verge-mihomo.exe"
+    [string]$ClashCoreExe
 )
 
 $ErrorActionPreference = "Continue"
@@ -27,6 +31,29 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = $ScriptDir
 }
+$ConfigScript = Join-Path $RepoRoot "HitNetClashConfig.ps1"
+if (Test-Path -LiteralPath $ConfigScript) {
+    . $ConfigScript
+    $Config = Resolve-HitNetClashConfig -ScriptDir $RepoRoot -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
+    $RasEntry = $Config.RasEntry
+    $ProxyUrl = $Config.ProxyUrl
+    $TunInterfaceAlias = $Config.TunInterfaceAlias
+    $TunIpv4Gateway = $Config.TunIpv4Gateway
+    $TunIpv6Gateway = $Config.TunIpv6Gateway
+    if ([string]::IsNullOrWhiteSpace($WinHttpProxyServer)) { $WinHttpProxyServer = $Config.ProxyServer }
+    if ([string]::IsNullOrWhiteSpace($ClashCoreExe)) { $ClashCoreExe = Join-Path (Split-Path -Parent $Config.ClashPath) "verge-mihomo.exe" }
+}
+else {
+    if ([string]::IsNullOrWhiteSpace($RasEntry)) { $RasEntry = "HITnet" }
+    if ([string]::IsNullOrWhiteSpace($ProxyUrl)) { $ProxyUrl = "http://127.0.0.1:7897" }
+    if ([string]::IsNullOrWhiteSpace($TunInterfaceAlias)) { $TunInterfaceAlias = "Meta" }
+    if ([string]::IsNullOrWhiteSpace($TunIpv4Gateway)) { $TunIpv4Gateway = "198.18.0.2" }
+    if ([string]::IsNullOrWhiteSpace($TunIpv6Gateway)) { $TunIpv6Gateway = "fdfe:dcba:9876::2" }
+    if ([string]::IsNullOrWhiteSpace($WinHttpProxyServer)) { $WinHttpProxyServer = "127.0.0.1:7897" }
+    if ([string]::IsNullOrWhiteSpace($ClashCoreExe)) { $ClashCoreExe = "D:\clash verge\verge-mihomo.exe" }
+}
+$ProxyPort = ([Uri]$ProxyUrl).Port
+$TunInterfacePattern = [regex]::Escape($TunInterfaceAlias)
 $RuntimeDir = Join-Path $RepoRoot ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
 $RuntimeBackupDir = Join-Path $RuntimeDir "backups"
@@ -222,7 +249,7 @@ function Enable-TrialClashTun {
             $i++
             if ($i -ge 135 -and $i -le 145) { "{0,4}: {1}" -f $i, $_ }
         }
-        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "Meta|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "Meta|TUN|Clash|Mihomo" } |
+        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "$TunInterfacePattern|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "$TunInterfacePattern|TUN|Clash|Mihomo" } |
             Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex |
             Format-Table -AutoSize
     }
@@ -242,7 +269,7 @@ function Enable-TrialClashTun {
             $i++
             if ($i -ge 135 -and $i -le 145) { "{0,4}: {1}" -f $i, $_ }
         }
-        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "Meta|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "Meta|TUN|Clash|Mihomo" } |
+        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "$TunInterfacePattern|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "$TunInterfacePattern|TUN|Clash|Mihomo" } |
             Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex |
             Format-Table -AutoSize
         Get-NetRoute -DestinationPrefix "0.0.0.0/0", "::/0" |
@@ -276,7 +303,7 @@ function Restore-TrialClashTun {
             $i++
             if ($i -ge 135 -and $i -le 145) { "{0,4}: {1}" -f $i, $_ }
         }
-        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "Meta|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "Meta|TUN|Clash|Mihomo" } |
+        Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match "$TunInterfacePattern|TUN|Clash|Mihomo" -or $_.InterfaceDescription -match "$TunInterfacePattern|TUN|Clash|Mihomo" } |
             Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex |
             Format-Table -AutoSize
     }
@@ -375,13 +402,16 @@ function Enable-TrialIpv6SplitRoute {
             Format-Table -AutoSize
     }
 
-    $metaV4 = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceAlias "Meta" -ErrorAction Stop | Select-Object -First 1
-    Add-TrialSplitRoute -DestinationPrefix "0.0.0.0/1" -InterfaceIndex $metaV4.ifIndex -InterfaceAlias "Meta" -NextHop $metaV4.NextHop -AddressFamily "IPv4"
-    Add-TrialSplitRoute -DestinationPrefix "128.0.0.0/1" -InterfaceIndex $metaV4.ifIndex -InterfaceAlias "Meta" -NextHop $metaV4.NextHop -AddressFamily "IPv4"
+    $metaV4 = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceAlias $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    $tunAdapter = Get-NetAdapter -Name $TunInterfaceAlias -ErrorAction Stop | Select-Object -First 1
+    $v4NextHop = if ($metaV4 -and -not [string]::IsNullOrWhiteSpace($metaV4.NextHop)) { $metaV4.NextHop } else { $TunIpv4Gateway }
+    Add-TrialSplitRoute -DestinationPrefix "0.0.0.0/1" -InterfaceIndex $tunAdapter.ifIndex -InterfaceAlias $TunInterfaceAlias -NextHop $v4NextHop -AddressFamily "IPv4"
+    Add-TrialSplitRoute -DestinationPrefix "128.0.0.0/1" -InterfaceIndex $tunAdapter.ifIndex -InterfaceAlias $TunInterfaceAlias -NextHop $v4NextHop -AddressFamily "IPv4"
 
-    $metaV6 = Get-NetRoute -DestinationPrefix "::/0" -InterfaceAlias "Meta" -ErrorAction Stop | Select-Object -First 1
-    Add-TrialSplitRoute -DestinationPrefix "::/1" -InterfaceIndex $metaV6.ifIndex -InterfaceAlias "Meta" -NextHop $metaV6.NextHop -AddressFamily "IPv6"
-    Add-TrialSplitRoute -DestinationPrefix "8000::/1" -InterfaceIndex $metaV6.ifIndex -InterfaceAlias "Meta" -NextHop $metaV6.NextHop -AddressFamily "IPv6"
+    $metaV6 = Get-NetRoute -DestinationPrefix "::/0" -InterfaceAlias $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    $v6NextHop = if ($metaV6 -and -not [string]::IsNullOrWhiteSpace($metaV6.NextHop)) { $metaV6.NextHop } else { $TunIpv6Gateway }
+    Add-TrialSplitRoute -DestinationPrefix "::/1" -InterfaceIndex $tunAdapter.ifIndex -InterfaceAlias $TunInterfaceAlias -NextHop $v6NextHop -AddressFamily "IPv6"
+    Add-TrialSplitRoute -DestinationPrefix "8000::/1" -InterfaceIndex $tunAdapter.ifIndex -InterfaceAlias $TunInterfaceAlias -NextHop $v6NextHop -AddressFamily "IPv6"
 
     Invoke-Logged "Split route after temporary rules" {
         Get-NetRoute -DestinationPrefix "0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
@@ -411,7 +441,7 @@ function Restore-TrialIpv6SplitRoute {
 
     Invoke-Logged "Split route final state" {
         Get-NetRoute -DestinationPrefix "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceAlias -eq "Meta" } |
+            Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias } |
             Select-Object DestinationPrefix, NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric, AddressFamily |
             Format-Table -AutoSize
     }
@@ -837,7 +867,7 @@ function Write-CodexConnectivitySnapshot {
                         LocalPort = $_.LocalPort
                         RemoteAddress = $_.RemoteAddress
                         RemotePort = $_.RemotePort
-                        ViaClash = ($_.RemoteAddress -eq "127.0.0.1" -and $_.RemotePort -eq 7897)
+                        ViaClash = ($_.RemoteAddress -eq "127.0.0.1" -and $_.RemotePort -eq $ProxyPort)
                     }
                 }
         }

@@ -1,6 +1,10 @@
-param(
-    [string]$RasEntry = "HITnet",
-    [string]$ProxyUrl = "http://127.0.0.1:7897",
+﻿param(
+    [string]$RasEntry,
+    [string]$ProxyUrl,
+    [string]$TunInterfaceAlias,
+    [string]$TunIpv4Gateway,
+    [string]$TunIpv6Gateway,
+    [string]$SettingsPath,
     [switch]$SkipProbe,
     [int]$ProbeAttempts = 3,
     [int]$ProbeRetryDelaySeconds = 3,
@@ -10,6 +14,25 @@ param(
 $ErrorActionPreference = "Continue"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+if (Test-Path -LiteralPath $ConfigScript) {
+    . $ConfigScript
+    $Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
+    $RasEntry = $Config.RasEntry
+    $ProxyUrl = $Config.ProxyUrl
+    $TunInterfaceAlias = $Config.TunInterfaceAlias
+    $TunIpv4Gateway = $Config.TunIpv4Gateway
+    $TunIpv6Gateway = $Config.TunIpv6Gateway
+    $ClashCoreProcessName = $Config.ClashCoreProcessName
+}
+else {
+    if ([string]::IsNullOrWhiteSpace($RasEntry)) { $RasEntry = "HITnet" }
+    if ([string]::IsNullOrWhiteSpace($ProxyUrl)) { $ProxyUrl = "http://127.0.0.1:7897" }
+    if ([string]::IsNullOrWhiteSpace($TunInterfaceAlias)) { $TunInterfaceAlias = "Meta" }
+    if ([string]::IsNullOrWhiteSpace($TunIpv4Gateway)) { $TunIpv4Gateway = "198.18.0.2" }
+    if ([string]::IsNullOrWhiteSpace($TunIpv6Gateway)) { $TunIpv6Gateway = "fdfe:dcba:9876::2" }
+    $ClashCoreProcessName = "verge-mihomo"
+}
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
@@ -69,7 +92,7 @@ function Remove-CodexNrptRules {
 function Remove-CodexSplitRoutes {
     Invoke-Logged "remove CodexClash split routes" {
         foreach ($prefix in @("0.0.0.0/1", "128.0.0.0/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias "Meta" -NextHop "198.18.0.2" -ErrorAction SilentlyContinue |
+            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv4Gateway -ErrorAction SilentlyContinue |
                 ForEach-Object {
                     "Removing IPv4 split route: $($_.DestinationPrefix) via $($_.NextHop)"
                     $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
@@ -77,7 +100,7 @@ function Remove-CodexSplitRoutes {
         }
 
         foreach ($prefix in @("::/1", "8000::/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias "Meta" -NextHop "fdfe:dcba:9876::2" -ErrorAction SilentlyContinue |
+            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv6Gateway -ErrorAction SilentlyContinue |
                 ForEach-Object {
                     "Removing IPv6 split route: $($_.DestinationPrefix) via $($_.NextHop)"
                     $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
@@ -135,7 +158,7 @@ function Write-FinalSnapshot {
             Format-Table -AutoSize
     }
     Invoke-Logged "final Clash listen" {
-        $proc = Get-Process verge-mihomo -ErrorAction SilentlyContinue | Select-Object -First 1
+        $proc = Get-Process -Name $ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($proc) {
             $proc | Select-Object Id, ProcessName, Path | Format-List
             Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
@@ -144,7 +167,7 @@ function Write-FinalSnapshot {
                 Format-Table -AutoSize
         }
         else {
-            "verge-mihomo not found"
+            "$ClashCoreProcessName not found"
         }
     }
     if (-not $SkipProbe) {
@@ -168,6 +191,7 @@ function Write-FinalSnapshot {
 
 Write-Log ("LogPath={0}" -f $LogPath)
 Write-Log ("Reason={0}" -f $Reason)
+Write-Log ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2}" -f $RasEntry, $ProxyUrl, $TunInterfaceAlias)
 Write-Log "Purpose=restore WLAN plus Clash by removing Codex PPPoE temporary networking changes."
 
 Remove-CodexNrptRules
