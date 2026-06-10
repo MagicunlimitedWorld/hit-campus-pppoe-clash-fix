@@ -13,10 +13,19 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogPath = Join-Path $ScriptDir ("enter_pppoe_codex_{0}.log" -f $Timestamp)
-$DonePath = Join-Path $ScriptDir ("enter_pppoe_codex_{0}.done" -f $Timestamp)
-$WatchdogLogPath = Join-Path $ScriptDir ("enter_pppoe_codex_watchdog_{0}.log" -f $Timestamp)
-$StatePath = Join-Path $ScriptDir "pppoe_codex_active_state.json"
+$RuntimeDir = Join-Path $ScriptDir ".runtime"
+$RuntimeLogDir = Join-Path $RuntimeDir "logs"
+$RuntimeMarkerDir = Join-Path $RuntimeDir "markers"
+$RuntimeStateDir = Join-Path $RuntimeDir "state"
+foreach ($dir in @($RuntimeLogDir, $RuntimeMarkerDir, $RuntimeStateDir)) {
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+}
+$LogPath = Join-Path $RuntimeLogDir ("enter_pppoe_codex_{0}.log" -f $Timestamp)
+$DonePath = Join-Path $RuntimeMarkerDir ("enter_pppoe_codex_{0}.done" -f $Timestamp)
+$WatchdogLogPath = Join-Path $RuntimeLogDir ("enter_pppoe_codex_watchdog_{0}.log" -f $Timestamp)
+$StatePath = Join-Path $RuntimeStateDir "pppoe_codex_active_state.json"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
 
 $NrptNamespaces = @(".openai.com", ".chatgpt.com", ".oaistatic.com", ".oaiusercontent.com", ".github.com")

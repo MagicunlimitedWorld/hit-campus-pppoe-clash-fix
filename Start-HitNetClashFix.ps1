@@ -11,6 +11,11 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $EnterScript = Join-Path $ScriptDir "enter_pppoe_codex.ps1"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
+$RuntimeDir = Join-Path $ScriptDir ".runtime"
+$RuntimeLogDir = Join-Path $RuntimeDir "logs"
+$RuntimeMarkerDir = Join-Path $RuntimeDir "markers"
+$RuntimeStateDir = Join-Path $RuntimeDir "state"
+$StatePath = Join-Path $RuntimeStateDir "pppoe_codex_active_state.json"
 if ([string]::IsNullOrWhiteSpace($SettingsPath)) {
     $SettingsPath = Join-Path $ScriptDir ".local\settings.json"
 }
@@ -76,6 +81,7 @@ function Get-AppSettings {
             Account = ""
             RememberPassword = $false
             PasswordProtected = ""
+            AutoCloseOnSuccess = $false
         }
     }
     try {
@@ -85,6 +91,7 @@ function Get-AppSettings {
             Account = [string]$settings.Account
             RememberPassword = [bool]$settings.RememberPassword
             PasswordProtected = [string]$settings.PasswordProtected
+            AutoCloseOnSuccess = [bool]$settings.AutoCloseOnSuccess
         }
     }
     catch {
@@ -93,6 +100,7 @@ function Get-AppSettings {
             Account = ""
             RememberPassword = $false
             PasswordProtected = ""
+            AutoCloseOnSuccess = $false
         }
     }
 }
@@ -102,7 +110,8 @@ function Save-AppSettings {
         [string]$Account,
         [securestring]$Password,
         [bool]$RememberAccount,
-        [bool]$RememberPassword
+        [bool]$RememberPassword,
+        [bool]$AutoCloseOnSuccess
     )
 
     $settingsDir = Split-Path -Parent $SettingsPath
@@ -120,6 +129,7 @@ function Save-AppSettings {
         Account = if ($RememberAccount) { $Account } else { "" }
         RememberPassword = $RememberPassword
         PasswordProtected = $protectedPassword
+        AutoCloseOnSuccess = $AutoCloseOnSuccess
     }
     $settings | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
 }
@@ -148,8 +158,48 @@ function Get-RasConnected {
 function Get-StateSummary {
     $rasText = if (Get-RasConnected) { "HITnet: 已连接" } else { "HITnet: 未连接" }
     $clashText = if (Test-ClashPort) { "Clash: 7897 已监听" } else { "Clash: 7897 未监听" }
-    $stateText = if (Test-Path -LiteralPath (Join-Path $ScriptDir "pppoe_codex_active_state.json")) { "状态文件: 存在" } else { "状态文件: 无" }
+    $stateText = if (Test-Path -LiteralPath $StatePath) { "状态文件: 存在" } else { "状态文件: 无" }
     return "$rasText    $clashText    $stateText"
+}
+
+function Get-DetailedStatusText {
+    param([string]$Label = "刷新状态")
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("=== {0} {1} ===" -f $Label, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))) | Out-Null
+    $lines.Add((Get-StateSummary)) | Out-Null
+    $lines.Add(("状态文件路径: {0}" -f $StatePath)) | Out-Null
+
+    $ras = (& rasdial.exe 2>&1 | Out-String).Trim()
+    $lines.Add("--- rasdial ---") | Out-Null
+    $lines.Add($(if ([string]::IsNullOrWhiteSpace($ras)) { "(no output)" } else { $ras })) | Out-Null
+
+    $lines.Add("--- Clash listen ---") | Out-Null
+    $proc = Get-Process verge-mihomo -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc) {
+        $listen = Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State |
+            Sort-Object LocalPort |
+            Out-String -Width 4096
+        $lines.Add($listen.Trim()) | Out-Null
+    }
+    else {
+        $lines.Add("verge-mihomo 未运行") | Out-Null
+    }
+
+    $nrpt = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+        Where-Object { $_.Comment -like "CodexClash*" -or $_.DisplayName -like "CodexClash*" } |
+        Select-Object Namespace, NameServers, Comment |
+        Out-String -Width 4096
+    $lines.Add("--- Codex NRPT ---") | Out-Null
+    $lines.Add($(if ([string]::IsNullOrWhiteSpace($nrpt)) { "(none)" } else { $nrpt.Trim() })) | Out-Null
+
+    $routes = Get-NetRoute -DestinationPrefix "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
+        Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric, InterfaceMetric, AddressFamily |
+        Out-String -Width 4096
+    $lines.Add("--- Codex split routes ---") | Out-Null
+    $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Invoke-SelfTest {
@@ -166,11 +216,20 @@ function Invoke-SelfTest {
     $testPath = Join-Path $ScriptDir ".local\selftest.settings.json"
     $script:SettingsPath = $testPath
     $secure = ConvertTo-SecureString "selftest-password" -AsPlainText -Force
-    Save-AppSettings -Account "selftest-account" -Password $secure -RememberAccount $true -RememberPassword $true
+    Save-AppSettings -Account "selftest-account" -Password $secure -RememberAccount $true -RememberPassword $true -AutoCloseOnSuccess $true
     $loaded = Get-AppSettings
     $plain = ConvertTo-PlainTextFromProtectedText -ProtectedText $loaded.PasswordProtected
-    if (-not $loaded.RememberAccount -or $loaded.Account -ne "selftest-account" -or $plain -ne "selftest-password") {
+    if (-not $loaded.RememberAccount -or $loaded.Account -ne "selftest-account" -or $plain -ne "selftest-password" -or -not $loaded.AutoCloseOnSuccess) {
         throw "SelfTest settings roundtrip failed."
+    }
+    $statusText = Get-DetailedStatusText -Label "SelfTest"
+    if ([string]::IsNullOrWhiteSpace($statusText) -or $statusText -notmatch "rasdial" -or $statusText -notmatch "Codex split routes") {
+        throw "SelfTest detailed status output failed."
+    }
+    foreach ($runtimePath in @($RuntimeLogDir, $RuntimeMarkerDir, $RuntimeStateDir)) {
+        if ([string]::IsNullOrWhiteSpace($runtimePath)) {
+            throw "SelfTest runtime path is empty."
+        }
     }
     Remove-Item -LiteralPath $testPath -Force -ErrorAction SilentlyContinue
     "SELFTEST_OK"
@@ -195,14 +254,14 @@ $settings = Get-AppSettings
 $form = [System.Windows.Forms.Form]::new()
 $form.Text = "HIT 校园网 PPPoE + Clash 修复"
 $form.StartPosition = "CenterScreen"
-$form.Size = [System.Drawing.Size]::new(560, 430)
-$form.MinimumSize = [System.Drawing.Size]::new(560, 430)
+$form.Size = [System.Drawing.Size]::new(680, 520)
+$form.MinimumSize = [System.Drawing.Size]::new(680, 520)
 $form.Font = [System.Drawing.Font]::new("Microsoft YaHei UI", 9)
 
 $statusLabel = [System.Windows.Forms.Label]::new()
 $statusLabel.AutoSize = $false
 $statusLabel.Location = [System.Drawing.Point]::new(18, 18)
-$statusLabel.Size = [System.Drawing.Size]::new(510, 24)
+$statusLabel.Size = [System.Drawing.Size]::new(620, 24)
 $statusLabel.Text = Get-StateSummary
 $form.Controls.Add($statusLabel)
 
@@ -265,9 +324,16 @@ $refreshButton.Size = [System.Drawing.Size]::new(80, 34)
 $refreshButton.Text = "刷新状态"
 $form.Controls.Add($refreshButton)
 
+$autoCloseBox = [System.Windows.Forms.CheckBox]::new()
+$autoCloseBox.Location = [System.Drawing.Point]::new(515, 141)
+$autoCloseBox.Size = [System.Drawing.Size]::new(140, 24)
+$autoCloseBox.Text = "成功后自动关闭"
+$autoCloseBox.Checked = [bool]$settings.AutoCloseOnSuccess
+$form.Controls.Add($autoCloseBox)
+
 $outputBox = [System.Windows.Forms.TextBox]::new()
 $outputBox.Location = [System.Drawing.Point]::new(20, 188)
-$outputBox.Size = [System.Drawing.Size]::new(508, 170)
+$outputBox.Size = [System.Drawing.Size]::new(630, 250)
 $outputBox.Multiline = $true
 $outputBox.ScrollBars = "Vertical"
 $outputBox.ReadOnly = $true
@@ -275,15 +341,16 @@ $outputBox.WordWrap = $false
 $form.Controls.Add($outputBox)
 
 $hintLabel = [System.Windows.Forms.Label]::new()
-$hintLabel.Location = [System.Drawing.Point]::new(20, 365)
-$hintLabel.Size = [System.Drawing.Size]::new(508, 20)
-$hintLabel.Text = "成功后窗口会自动关闭；失败时请查看日志并可点击一键切换回 WLAN。"
+$hintLabel.Location = [System.Drawing.Point]::new(20, 448)
+$hintLabel.Size = [System.Drawing.Size]::new(630, 20)
+$hintLabel.Text = "默认成功后不关闭窗口；勾选成功后自动关闭才会自动退出。"
 $form.Controls.Add($hintLabel)
 
 $script:CurrentJob = $null
 $script:CurrentAction = ""
 $script:CloseAfterSuccess = $false
 $script:SuccessSeenAt = $null
+$script:LastJobOutputText = ""
 
 function Set-ControlsBusy {
     param([bool]$Busy)
@@ -294,6 +361,7 @@ function Set-ControlsBusy {
     $passwordBox.Enabled = -not $Busy
     $rememberAccountBox.Enabled = -not $Busy
     $rememberPasswordBox.Enabled = -not $Busy
+    $autoCloseBox.Enabled = -not $Busy
 }
 
 function Append-Output {
@@ -301,6 +369,16 @@ function Append-Output {
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         $outputBox.AppendText($Text.TrimEnd() + [Environment]::NewLine)
     }
+}
+
+function Save-CurrentUiSettings {
+    if ([string]::IsNullOrEmpty($passwordBox.Text)) {
+        $securePassword = [securestring]::new()
+    }
+    else {
+        $securePassword = ConvertTo-SecureString $passwordBox.Text -AsPlainText -Force
+    }
+    Save-AppSettings -Account $accountBox.Text.Trim() -Password $securePassword -RememberAccount $rememberAccountBox.Checked -RememberPassword $rememberPasswordBox.Checked -AutoCloseOnSuccess $autoCloseBox.Checked
 }
 
 function Start-BackendJob {
@@ -312,8 +390,14 @@ function Start-BackendJob {
 
     Set-ControlsBusy -Busy $true
     $script:CurrentAction = $Action
+    $script:CloseAfterSuccess = $false
+    $script:SuccessSeenAt = $null
+    $script:LastJobOutputText = ""
     $statusLabel.Text = if ($Action -eq "connect") { "正在连接有线网..." } else { "正在切换回 WLAN..." }
     $outputBox.Clear()
+    Append-Output ("=== {0} {1} ===" -f ($(if ($Action -eq "connect") { "连接有线网" } else { "切换回 WLAN" }), (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
+    Append-Output ("脚本: {0}" -f $(if ($Action -eq "connect") { $EnterScript } else { $RestoreScript }))
+    Append-Output ("日志目录: {0}" -f $RuntimeLogDir)
 
     if ($Action -eq "connect") {
         $script:CurrentJob = Start-Job -ArgumentList $EnterScript, $RasEntry, $ProxyUrl, $Credential -ScriptBlock {
@@ -331,6 +415,7 @@ function Start-BackendJob {
 
 $refreshButton.Add_Click({
     $statusLabel.Text = Get-StateSummary
+    Append-Output (Get-DetailedStatusText -Label "刷新状态")
 })
 
 $connectButton.Add_Click({
@@ -344,12 +429,13 @@ $connectButton.Add_Click({
     }
 
     $securePassword = ConvertTo-SecureString $passwordBox.Text -AsPlainText -Force
-    Save-AppSettings -Account $accountBox.Text.Trim() -Password $securePassword -RememberAccount $rememberAccountBox.Checked -RememberPassword $rememberPasswordBox.Checked
+    Save-AppSettings -Account $accountBox.Text.Trim() -Password $securePassword -RememberAccount $rememberAccountBox.Checked -RememberPassword $rememberPasswordBox.Checked -AutoCloseOnSuccess $autoCloseBox.Checked
     $credential = [pscredential]::new($accountBox.Text.Trim(), $securePassword)
     Start-BackendJob -Action "connect" -Credential $credential
 })
 
 $restoreButton.Add_Click({
+    Save-CurrentUiSettings
     Start-BackendJob -Action "restore"
 })
 
@@ -357,22 +443,41 @@ $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 700
 $timer.Add_Tick({
     if ($null -ne $script:CurrentJob) {
+        $currentOutput = Receive-Job -Job $script:CurrentJob -Keep -ErrorAction SilentlyContinue | Out-String -Width 4096
+        if ($currentOutput.Length -gt $script:LastJobOutputText.Length -and $currentOutput.StartsWith($script:LastJobOutputText)) {
+            $newOutput = $currentOutput.Substring($script:LastJobOutputText.Length)
+            Append-Output $newOutput
+            $script:LastJobOutputText = $currentOutput
+        }
+        elseif ($currentOutput -ne $script:LastJobOutputText) {
+            Append-Output $currentOutput
+            $script:LastJobOutputText = $currentOutput
+        }
+
         if ($script:CurrentJob.State -in @("Completed", "Failed", "Stopped")) {
-            $output = Receive-Job -Job $script:CurrentJob -ErrorAction SilentlyContinue | Out-String -Width 4096
+            $output = Receive-Job -Job $script:CurrentJob -Keep -ErrorAction SilentlyContinue | Out-String -Width 4096
             $state = $script:CurrentJob.State
             Remove-Job -Job $script:CurrentJob -Force -ErrorAction SilentlyContinue
             $script:CurrentJob = $null
-            Append-Output $output
 
             $successToken = if ($script:CurrentAction -eq "connect") { "ENTER_PPPOE_CODEX_OK" } else { "RESTORE_WLAN_CLASH_DONE" }
             $success = ($state -eq "Completed" -and $output -match [regex]::Escape($successToken))
             if ($success) {
-                $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "连接成功，窗口即将关闭。" } else { "已切换回 WLAN，窗口即将关闭。" }
-                $script:CloseAfterSuccess = $true
-                $script:SuccessSeenAt = Get-Date
+                Append-Output (Get-DetailedStatusText -Label "操作完成后状态")
+                if ($autoCloseBox.Checked) {
+                    $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "连接成功，窗口即将关闭。" } else { "已切换回 WLAN，窗口即将关闭。" }
+                    $script:CloseAfterSuccess = $true
+                    $script:SuccessSeenAt = Get-Date
+                }
+                else {
+                    $statusLabel.Text = Get-StateSummary
+                    Append-Output "操作成功。窗口保持打开。"
+                    Set-ControlsBusy -Busy $false
+                }
             }
             else {
                 $statusLabel.Text = "操作失败。请查看输出，必要时点击一键切换回 WLAN。"
+                Append-Output "操作失败。请检查上方输出和 .runtime/logs 中的日志。"
                 Set-ControlsBusy -Busy $false
             }
         }

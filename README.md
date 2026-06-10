@@ -24,14 +24,16 @@ Start-HitNetClashFix.cmd
 
 1. 输入 HIT 校园网账号和密码。
 2. 按需勾选“记住账号”“记住密码”。
-3. 点击“连接有线网”。
-4. 成功后窗口会自动关闭。
+3. 如需成功后自动退出，勾选“成功后自动关闭”。
+4. 点击“连接有线网”。
 
 切换回 WLAN：
 
 1. 再次双击 `Start-HitNetClashFix.cmd`。
-2. 点击“一键切换回 WLAN”。
-3. 成功后窗口会自动关闭。
+2. 如需成功后自动退出，勾选“成功后自动关闭”。
+3. 点击“一键切换回 WLAN”。
+
+下方输出框会显示刷新状态、连接和切换过程中的摘要与脚本输出。默认成功后窗口保持打开，便于确认状态。
 
 ## 文件说明
 
@@ -47,6 +49,13 @@ Start-HitNetClashFix.cmd
 - “记住账号”会保存到 `.local/settings.json`。
 - “记住密码”会使用 Windows DPAPI 加密，只能由当前 Windows 用户解密。
 - `.local/` 已加入 `.gitignore`，不会上传到 GitHub。
+
+## 运行文件归档
+
+- 日志：`.runtime/logs/`
+- done marker：`.runtime/markers/`
+- active state：`.runtime/state/pppoe_codex_active_state.json`
+- `.runtime/` 已加入 `.gitignore`，不会上传到 GitHub。
 
 ## 高级命令行用法
 
@@ -84,7 +93,7 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 - 不关闭 WLAN。
 - 不修改 Clash 配置。
 - 不修改 DNS、MTU 或系统代理的永久配置。
-- 不上传日志、运行状态、Clash 配置备份或 `.local/` 本地凭据。
+- 不上传日志、运行状态、Clash 配置备份、`.runtime/` 或 `.local/` 本地凭据。
 
 ## License
 

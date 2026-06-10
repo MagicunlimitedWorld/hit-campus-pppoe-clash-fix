@@ -11,8 +11,17 @@ $ErrorActionPreference = "Continue"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogPath = Join-Path $ScriptDir ("restore_wlan_clash_{0}.log" -f $Timestamp)
-$StatePath = Join-Path $ScriptDir "pppoe_codex_active_state.json"
+$RuntimeDir = Join-Path $ScriptDir ".runtime"
+$RuntimeLogDir = Join-Path $RuntimeDir "logs"
+$RuntimeStateDir = Join-Path $RuntimeDir "state"
+foreach ($dir in @($RuntimeLogDir, $RuntimeStateDir)) {
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+}
+$LogPath = Join-Path $RuntimeLogDir ("restore_wlan_clash_{0}.log" -f $Timestamp)
+$StatePath = Join-Path $RuntimeStateDir "pppoe_codex_active_state.json"
+$LegacyStatePath = Join-Path $ScriptDir "pppoe_codex_active_state.json"
 
 function Write-Log {
     param([string]$Message = "")
@@ -92,12 +101,14 @@ function Disconnect-RasIfNeeded {
 
 function Remove-StateFile {
     Invoke-Logged "remove active state file" {
-        if (Test-Path -LiteralPath $StatePath) {
-            Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
-            "Removed $StatePath"
-        }
-        else {
-            "State file not found: $StatePath"
+        foreach ($path in @($StatePath, $LegacyStatePath)) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                "Removed $path"
+            }
+            else {
+                "State file not found: $path"
+            }
         }
     }
 }

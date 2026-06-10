@@ -23,8 +23,20 @@ param(
 $ErrorActionPreference = "Continue"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$RepoRoot = Split-Path -Parent $ScriptDir
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = $ScriptDir
+}
+$RuntimeDir = Join-Path $RepoRoot ".runtime"
+$RuntimeLogDir = Join-Path $RuntimeDir "logs"
+$RuntimeBackupDir = Join-Path $RuntimeDir "backups"
+foreach ($dir in @($RuntimeLogDir, $RuntimeBackupDir)) {
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+}
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogPath = Join-Path $ScriptDir ("pppoe_clash_restore_{0}.log" -f $Timestamp)
+$LogPath = Join-Path $RuntimeLogDir ("pppoe_clash_restore_{0}.log" -f $Timestamp)
 $script:OriginalWinHttpProxyText = $null
 $script:WinHttpProxyChanged = $false
 $script:OriginalRasConnectionSettings = $null
@@ -34,7 +46,7 @@ $script:OriginalUserInternetSettings = $null
 $script:UserInternetProxyChanged = $false
 $script:InternetSettingsRegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 $script:ClashConfigPath = Join-Path $ClashHome "clash-verge.yaml"
-$script:ClashTunBackupPath = Join-Path $ScriptDir ("clash-verge.before-tun.{0}.yaml" -f $Timestamp)
+$script:ClashTunBackupPath = Join-Path $RuntimeBackupDir ("clash-verge.before-tun.{0}.yaml" -f $Timestamp)
 $script:OriginalClashConfigText = $null
 $script:ClashTunChanged = $false
 $script:NrptTrialNamespaces = @(".openai.com", ".chatgpt.com", ".oaistatic.com", ".oaiusercontent.com", ".github.com")

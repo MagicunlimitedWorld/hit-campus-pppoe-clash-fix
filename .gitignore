@@ -3,6 +3,7 @@
 *.done
 pppoe_codex_active_state.json
 .local/
+.runtime/
 
 # Local network/proxy backups
 backups/
