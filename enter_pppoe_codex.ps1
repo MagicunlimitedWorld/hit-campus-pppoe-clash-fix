@@ -384,18 +384,21 @@ function Add-SplitRoute {
         [string]$AddressFamily
     )
 
-    $existing = Get-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -ErrorAction SilentlyContinue
-    if ($existing) {
-        throw "Split route already exists: $DestinationPrefix via $NextHop on ifIndex $InterfaceIndex."
-    }
-
-    New-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
-    $AddedRoutes.Add([pscustomobject]@{
+    $routeState = [pscustomobject]@{
         DestinationPrefix = $DestinationPrefix
         InterfaceIndex = $InterfaceIndex
         NextHop = $NextHop
         AddressFamily = $AddressFamily
-    }) | Out-Null
+    }
+    $existing = Get-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Log "Split route already exists and will be reused: $DestinationPrefix via $NextHop on ifIndex $InterfaceIndex."
+        $AddedRoutes.Add($routeState) | Out-Null
+        return
+    }
+
+    New-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
+    $AddedRoutes.Add($routeState) | Out-Null
 }
 
 function Add-EnterSplitRoutes {

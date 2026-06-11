@@ -92,6 +92,7 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 
 - Clash 未启动：工具会按配置路径尝试启动 Clash Verge；若失败，请在 UI 中选择正确的 `clash-verge.exe`。
 - TUN 网卡未就绪：请先在 Clash Verge 中开启 TUN/Meta；本工具不会修改 Clash 配置。
+- TUN 已提前创建 split route：工具会复用现有路由，不会因此判定连接失败。
 - RAS `629`：通常是校园侧终止 PPPoE 认证/注册。等待 1-2 分钟后重试，若持续出现，请检查账号权限、在线会话限制、墙口/交换机端口、VLAN 或 PPPoE 服务状态。
 - 无法恢复：运行 `restore_wlan_clash.ps1`。脚本只清理本项目创建的临时 NRPT 和 split route。
 
