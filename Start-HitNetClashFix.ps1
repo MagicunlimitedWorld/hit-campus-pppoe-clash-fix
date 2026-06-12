@@ -36,6 +36,13 @@ $script:RasEntryBox = $null
 $script:ProxyUrlBox = $null
 $script:TunAliasBox = $null
 $script:ClashPathBox = $null
+$script:StateSummaryCache = [pscustomobject]@{
+    Text = "状态读取中..."
+    ExpiresAt = [datetime]::MinValue
+    AutoConnectEnabled = $null
+    AutoConnectStatusText = "登录后自动连接: 未检查"
+}
+$script:StateSummaryTtlSeconds = 10
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -248,15 +255,23 @@ function Get-TunReady {
 }
 
 function Get-EthernetReady {
-    $adapter = Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Status -eq "Up" -and
-            $_.Name -ne $script:CurrentConfig.TunInterfaceAlias -and
-            $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth" -and
-            $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
-        } |
-        Select-Object -First 1
-    return [bool]$adapter
+    foreach ($pattern in @($script:CurrentConfig.EthernetNamePatterns)) {
+        if ([string]::IsNullOrWhiteSpace($pattern)) {
+            continue
+        }
+        $namePattern = "*$($pattern.Trim())*"
+        $adapter = Get-NetAdapter -Name $namePattern -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Status -eq "Up" -and
+                $_.Name -ne $script:CurrentConfig.TunInterfaceAlias -and
+                $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth"
+            } |
+            Select-Object -First 1
+        if ($adapter) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-AutoConnectTask {
@@ -314,38 +329,90 @@ function Unregister-AutoConnectTask {
     }
 }
 
+function Set-StateSummaryCache {
+    param(
+        [string]$Text,
+        $AutoConnectEnabled = $null,
+        [string]$AutoConnectStatusText = ""
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        $script:StateSummaryCache.Text = $Text
+        $script:StateSummaryCache.ExpiresAt = (Get-Date).AddSeconds($script:StateSummaryTtlSeconds)
+    }
+    if ($null -ne $AutoConnectEnabled) {
+        $script:StateSummaryCache.AutoConnectEnabled = [bool]$AutoConnectEnabled
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AutoConnectStatusText)) {
+        $script:StateSummaryCache.AutoConnectStatusText = $AutoConnectStatusText
+    }
+}
+
 function Get-StateSummary {
-    $cfg = Get-UiConfig
-    $rasText = if (Get-RasConnected -EntryName $cfg.RasEntry) { "$($cfg.RasEntry): 已连接" } else { "$($cfg.RasEntry): 未连接" }
-    $clashText = if (Test-ClashPort -Url $cfg.ProxyUrl) { "Clash: 已监听" } else { "Clash: 未监听" }
-    $tunText = if (Get-TunReady -Alias $cfg.TunInterfaceAlias) { "TUN: 已就绪" } else { "TUN: 未就绪" }
-    $ethText = if (Get-EthernetReady) { "有线: 已连接" } else { "有线: 未就绪" }
-    $stateText = if (Test-Path -LiteralPath $StatePath) { "状态文件: 存在" } else { "状态文件: 无" }
-    $autoText = if (Get-AutoConnectTask) { "自启: 已启用" } else { "自启: 未启用" }
-    return "$rasText    $clashText    $tunText    $ethText    $stateText    $autoText"
+    return $script:StateSummaryCache.Text
 }
 
 function Get-DetailedStatusText {
     param([string]$Label = "刷新状态")
 
     $cfg = Get-UiConfig
+    $ras = ""
+    try {
+        $ras = (& rasdial.exe 2>&1 | Out-String).Trim()
+    }
+    catch {
+        $ras = "rasdial failed: $($_.Exception.Message)"
+    }
+
+    $proxyListening = Test-ClashPort -Url $cfg.ProxyUrl
+    $tunAdapter = Get-NetAdapter -Name $cfg.TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    $stateExists = Test-Path -LiteralPath $StatePath
+    $task = Get-AutoConnectTask
+    $taskText = "登录后自动连接: 未启用"
+    if ($task) {
+        try {
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $AutoConnectTaskName -ErrorAction Stop
+            $taskText = "登录后自动连接: 已启用 State=$($task.State) LastRun=$($taskInfo.LastRunTime) LastResult=$($taskInfo.LastTaskResult)"
+        }
+        catch {
+            $taskText = "登录后自动连接: 已启用 State=$($task.State)"
+        }
+    }
+
+    $tunPattern = [regex]::Escape($cfg.TunInterfaceAlias)
+    $adapterObjects = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+    $ethernetReady = [bool]($adapterObjects |
+        Where-Object {
+            $_.Status -eq "Up" -and
+            $_.Name -ne $cfg.TunInterfaceAlias -and
+            $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth" -and
+            $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
+        } |
+        Select-Object -First 1)
+    $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+        $cfg.RasEntry,
+        $(if ($ras -match [regex]::Escape($cfg.RasEntry)) { "已连接" } else { "未连接" }),
+        $(if ($proxyListening) { "已监听" } else { "未监听" }),
+        $(if ($tunAdapter -and $tunAdapter.Status -eq "Up") { "已就绪" } else { "未就绪" }),
+        $(if ($ethernetReady) { "已连接" } else { "未就绪" }),
+        $(if ($stateExists) { "存在" } else { "无" }),
+        $(if ($task) { "已启用" } else { "未启用" })
+
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(("=== {0} {1} ===" -f $Label, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))) | Out-Null
-    $lines.Add((Get-StateSummary)) | Out-Null
+    $lines.Add($summary) | Out-Null
     $lines.Add(("PPPoE: {0}" -f $cfg.RasEntry)) | Out-Null
     $lines.Add(("Proxy: {0}" -f $cfg.ProxyUrl)) | Out-Null
     $lines.Add(("TUN: {0}" -f $cfg.TunInterfaceAlias)) | Out-Null
     $lines.Add(("ClashPath: {0}" -f $cfg.ClashPath)) | Out-Null
     $lines.Add(("状态文件路径: {0}" -f $StatePath)) | Out-Null
-    $lines.Add((Get-AutoConnectTaskStatusText)) | Out-Null
+    $lines.Add($taskText) | Out-Null
 
-    $ras = (& rasdial.exe 2>&1 | Out-String).Trim()
     $lines.Add("--- rasdial ---") | Out-Null
     $lines.Add($(if ([string]::IsNullOrWhiteSpace($ras)) { "(no output)" } else { $ras })) | Out-Null
 
     $lines.Add("--- adapters ---") | Out-Null
-    $tunPattern = [regex]::Escape($cfg.TunInterfaceAlias)
-    $adapters = Get-NetAdapter -ErrorAction SilentlyContinue |
+    $adapters = $adapterObjects |
         Where-Object { $_.Name -match "WLAN|Wi-?Fi|以太|Ethernet|Meta|Clash|TUN|$tunPattern" -or $_.InterfaceDescription -match "Wireless|Ethernet|Meta|Clash|TUN|$tunPattern" } |
         Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex |
         Out-String -Width 4096
@@ -378,7 +445,6 @@ function Get-DetailedStatusText {
     $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
 
     $lines.Add("--- logon auto-connect task ---") | Out-Null
-    $task = Get-AutoConnectTask
     if ($task) {
         $taskActions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
         $lines.Add($taskActions) | Out-Null
@@ -485,7 +551,7 @@ $form.Controls.Add($loginGroup)
 $advancedGroup = [System.Windows.Forms.GroupBox]::new()
 $advancedGroup.Location = [System.Drawing.Point]::new(20, 210)
 $advancedGroup.Size = [System.Drawing.Size]::new(700, 124)
-$advancedGroup.Text = "高级配置"
+$advancedGroup.Text = "高级配置（通常不用改）"
 $form.Controls.Add($advancedGroup)
 
 $accountLabel = [System.Windows.Forms.Label]::new()
@@ -540,7 +606,7 @@ $autoConnectBox = [System.Windows.Forms.CheckBox]::new()
 $autoConnectBox.Location = [System.Drawing.Point]::new(510, 60)
 $autoConnectBox.Size = [System.Drawing.Size]::new(180, 24)
 $autoConnectBox.Text = "登录后自动连接"
-$autoConnectBox.Checked = [bool](Get-AutoConnectTask)
+$autoConnectBox.Checked = [bool]$settings.AutoConnectOnLogon
 $loginGroup.Controls.Add($autoConnectBox)
 
 $pppoeLabel = [System.Windows.Forms.Label]::new()
@@ -603,9 +669,15 @@ $refreshButton.Size = [System.Drawing.Size]::new(90, 36)
 $refreshButton.Text = "刷新状态"
 $form.Controls.Add($refreshButton)
 
+$diagButton = [System.Windows.Forms.Button]::new()
+$diagButton.Location = [System.Drawing.Point]::new(120, 350)
+$diagButton.Size = [System.Drawing.Size]::new(118, 36)
+$diagButton.Text = "复制脱敏诊断"
+$form.Controls.Add($diagButton)
+
 $connectButton = [System.Windows.Forms.Button]::new()
-$connectButton.Location = [System.Drawing.Point]::new(128, 350)
-$connectButton.Size = [System.Drawing.Size]::new(220, 36)
+$connectButton.Location = [System.Drawing.Point]::new(252, 350)
+$connectButton.Size = [System.Drawing.Size]::new(190, 36)
 $connectButton.Text = "修复 PPPoE + Clash"
 $connectButton.BackColor = [System.Drawing.SystemColors]::Highlight
 $connectButton.ForeColor = [System.Drawing.Color]::White
@@ -614,20 +686,20 @@ $connectButton.UseVisualStyleBackColor = $false
 $form.Controls.Add($connectButton)
 
 $pppoeOnlyButton = [System.Windows.Forms.Button]::new()
-$pppoeOnlyButton.Location = [System.Drawing.Point]::new(362, 350)
-$pppoeOnlyButton.Size = [System.Drawing.Size]::new(180, 36)
+$pppoeOnlyButton.Location = [System.Drawing.Point]::new(454, 350)
+$pppoeOnlyButton.Size = [System.Drawing.Size]::new(148, 36)
 $pppoeOnlyButton.Text = "仅拨号有线 PPPoE"
 $form.Controls.Add($pppoeOnlyButton)
 
 $restoreButton = [System.Windows.Forms.Button]::new()
-$restoreButton.Location = [System.Drawing.Point]::new(556, 350)
-$restoreButton.Size = [System.Drawing.Size]::new(164, 36)
-$restoreButton.Text = "一键切回 WLAN"
+$restoreButton.Location = [System.Drawing.Point]::new(614, 350)
+$restoreButton.Size = [System.Drawing.Size]::new(106, 36)
+$restoreButton.Text = "切回 WLAN"
 $form.Controls.Add($restoreButton)
 
 $outputBox = [System.Windows.Forms.TextBox]::new()
-$outputBox.Location = [System.Drawing.Point]::new(20, 404)
-$outputBox.Size = [System.Drawing.Size]::new(700, 208)
+$outputBox.Location = [System.Drawing.Point]::new(20, 398)
+$outputBox.Size = [System.Drawing.Size]::new(700, 214)
 $outputBox.Multiline = $true
 $outputBox.ScrollBars = "Vertical"
 $outputBox.ReadOnly = $true
@@ -637,19 +709,21 @@ $form.Controls.Add($outputBox)
 $hintLabel = [System.Windows.Forms.Label]::new()
 $hintLabel.Location = [System.Drawing.Point]::new(20, 626)
 $hintLabel.Size = [System.Drawing.Size]::new(700, 32)
-$hintLabel.Text = "主按钮修复 PPPoE + Clash；仅拨号模式不启动或修改 Clash，不添加 NRPT/split route。"
+$hintLabel.Text = "主按钮修复 PPPoE + Clash；仅拨号不处理 Clash；脱敏诊断可直接发给维护者排查。"
 $form.Controls.Add($hintLabel)
 
 $script:CurrentJob = $null
 $script:CurrentAction = ""
+$script:CurrentJobOutputBuffer = $null
+$script:StatusJob = $null
+$script:StatusJobMode = ""
 $script:CloseAfterSuccess = $false
 $script:SuccessSeenAt = $null
-$script:LastJobOutputText = ""
 $script:SuppressAutoConnectChange = $false
 
 function Set-ControlsBusy {
     param([bool]$Busy)
-    foreach ($control in @($connectButton, $pppoeOnlyButton, $restoreButton, $refreshButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $autoConnectBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
+    foreach ($control in @($connectButton, $pppoeOnlyButton, $restoreButton, $refreshButton, $diagButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $autoConnectBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
         $control.Enabled = -not $Busy
     }
 }
@@ -669,6 +743,350 @@ function Set-AutoConnectChecked {
     }
     finally {
         $script:SuppressAutoConnectChange = $false
+    }
+}
+
+function Get-MaskedAccount {
+    param([string]$Account)
+
+    if ([string]::IsNullOrWhiteSpace($Account)) {
+        return "(未填写)"
+    }
+    $text = $Account.Trim()
+    if ($text.Length -le 2) {
+        return ("*" * $text.Length)
+    }
+    if ($text.Length -le 6) {
+        return $text.Substring(0, 1) + ("*" * ($text.Length - 2)) + $text.Substring($text.Length - 1)
+    }
+    return $text.Substring(0, 2) + "***" + $text.Substring($text.Length - 2)
+}
+
+function Get-StatusJobConfig {
+    $cfg = Get-UiConfig
+    return [pscustomobject]@{
+        RasEntry = $cfg.RasEntry
+        ProxyUrl = $cfg.ProxyUrl
+        TunInterfaceAlias = $cfg.TunInterfaceAlias
+        TunIpv4Gateway = $cfg.TunIpv4Gateway
+        TunIpv6Gateway = $cfg.TunIpv6Gateway
+        ClashPath = $cfg.ClashPath
+        ClashCoreProcessName = $script:CurrentConfig.ClashCoreProcessName
+        EthernetNamePatterns = @($script:CurrentConfig.EthernetNamePatterns)
+        NrptNamespaces = @($script:CurrentConfig.NrptNamespaces)
+    }
+}
+
+function Start-StatusRefreshJob {
+    param(
+        [ValidateSet("Summary", "Detailed", "Sanitized")]
+        [string]$Mode,
+        [string]$Label = "刷新状态",
+        [string]$MaskedAccount = ""
+    )
+
+    if ($null -ne $script:StatusJob) {
+        if ($script:StatusJob.State -eq "Running") {
+            return $false
+        }
+        Remove-Job -Job $script:StatusJob -Force -ErrorAction SilentlyContinue
+        $script:StatusJob = $null
+    }
+
+    $jobConfig = Get-StatusJobConfig
+    $script:StatusJobMode = $Mode
+    $script:StatusJob = Start-Job -ArgumentList $Mode, $Label, $jobConfig, $StatePath, $AutoConnectTaskName, $MaskedAccount -ScriptBlock {
+        param($Mode, $Label, $Config, $StatePathValue, $TaskName, $MaskedAccountValue)
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+
+        function Test-LocalProxyPort {
+            param([string]$Url)
+            try {
+                $uri = [Uri]$Url
+                $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
+                $client = [System.Net.Sockets.TcpClient]::new()
+                try {
+                    $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
+                    if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
+                        return $false
+                    }
+                    $client.EndConnect($async)
+                    return $true
+                }
+                finally {
+                    $client.Close()
+                }
+            }
+            catch {
+                return $false
+            }
+        }
+
+        function Test-TargetEthernetReady {
+            param($Config)
+            foreach ($pattern in @($Config.EthernetNamePatterns)) {
+                if ([string]::IsNullOrWhiteSpace([string]$pattern)) {
+                    continue
+                }
+                $namePattern = "*$(([string]$pattern).Trim())*"
+                $adapter = Get-NetAdapter -Name $namePattern -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Status -eq "Up" -and
+                        $_.Name -ne $Config.TunInterfaceAlias -and
+                        $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth"
+                    } |
+                    Select-Object -First 1
+                if ($adapter) {
+                    return $true
+                }
+            }
+            return $false
+        }
+
+        function Get-TaskSnapshot {
+            param([string]$TaskName)
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $task) {
+                return [pscustomobject]@{
+                    Enabled = $false
+                    Text = "登录后自动连接: 未启用"
+                    ActionText = "(not registered)"
+                }
+            }
+            $text = "登录后自动连接: 已启用 State=$($task.State)"
+            try {
+                $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+                $text = "登录后自动连接: 已启用 State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
+            }
+            catch {
+            }
+            $actions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
+            if ([string]::IsNullOrWhiteSpace($actions)) {
+                $actions = "(registered without action text)"
+            }
+            return [pscustomobject]@{
+                Enabled = $true
+                Text = $text
+                ActionText = $actions
+            }
+        }
+
+        function New-StatusResult {
+            param(
+                [string]$Mode,
+                [string]$SummaryText,
+                [bool]$AutoConnectEnabled,
+                [string]$AutoConnectStatusText,
+                [string]$DetailText = "",
+                [string]$DiagnosticText = "",
+                [string]$HintText = "",
+                [string]$ErrorText = ""
+            )
+            $watch.Stop()
+            return [pscustomobject]@{
+                Mode = $Mode
+                SummaryText = $SummaryText
+                AutoConnectEnabled = $AutoConnectEnabled
+                AutoConnectStatusText = $AutoConnectStatusText
+                DetailText = $DetailText
+                DiagnosticText = $DiagnosticText
+                HintText = $HintText
+                Error = $ErrorText
+                DurationMs = [math]::Round($watch.Elapsed.TotalMilliseconds, 1)
+            }
+        }
+
+        try {
+            $rasRaw = (& rasdial.exe 2>&1 | Out-String).Trim()
+            $rasConnected = $rasRaw -match [regex]::Escape($Config.RasEntry)
+            $proxyListening = Test-LocalProxyPort -Url $Config.ProxyUrl
+            $tunAdapter = Get-NetAdapter -Name $Config.TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+            $tunReady = ($tunAdapter -and $tunAdapter.Status -eq "Up")
+            $ethernetReady = Test-TargetEthernetReady -Config $Config
+            $stateExists = Test-Path -LiteralPath $StatePathValue
+            $taskSnapshot = Get-TaskSnapshot -TaskName $TaskName
+
+            $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+                $Config.RasEntry,
+                $(if ($rasConnected) { "已连接" } else { "未连接" }),
+                $(if ($proxyListening) { "已监听" } else { "未监听" }),
+                $(if ($tunReady) { "已就绪" } else { "未就绪" }),
+                $(if ($ethernetReady) { "已连接" } else { "未就绪" }),
+                $(if ($stateExists) { "存在" } else { "无" }),
+                $(if ($taskSnapshot.Enabled) { "已启用" } else { "未启用" })
+
+            $hintLines = New-Object System.Collections.Generic.List[string]
+            if ([string]::IsNullOrWhiteSpace($Config.ClashPath) -or -not (Test-Path -LiteralPath $Config.ClashPath -ErrorAction SilentlyContinue)) {
+                $hintLines.Add("Clash 路径未找到：点击浏览按钮选择 clash-verge.exe。") | Out-Null
+            }
+            if (-not $proxyListening) {
+                $hintLines.Add("Clash 代理端口未监听：先启动 Clash Verge，并确认代理地址/端口正确。") | Out-Null
+            }
+            if (-not $tunReady) {
+                $hintLines.Add("TUN 未就绪：先在 Clash Verge 中开启 TUN/Meta 网卡。") | Out-Null
+            }
+            if (-not $ethernetReady) {
+                $hintLines.Add("有线未就绪：插好网线；若网卡名特殊，请在配置中补充 EthernetNamePatterns。") | Out-Null
+            }
+            $hintText = $hintLines -join [Environment]::NewLine
+
+            if ($Mode -eq "Summary") {
+                return New-StatusResult -Mode $Mode -SummaryText $summary -AutoConnectEnabled $taskSnapshot.Enabled -AutoConnectStatusText $taskSnapshot.Text -HintText $hintText
+            }
+
+            $prefixes = @("0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1")
+            $adapterObjects = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+            $nrptRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+                Where-Object { $_.Comment -like "CodexClash*" -or $_.DisplayName -like "CodexClash*" })
+            $splitRoutes = @(Get-NetRoute -DestinationPrefix $prefixes -ErrorAction SilentlyContinue)
+            $expectedRoutes = @(
+                [pscustomobject]@{ Prefix = "0.0.0.0/1"; NextHop = $Config.TunIpv4Gateway },
+                [pscustomobject]@{ Prefix = "128.0.0.0/1"; NextHop = $Config.TunIpv4Gateway },
+                [pscustomobject]@{ Prefix = "::/1"; NextHop = $Config.TunIpv6Gateway },
+                [pscustomobject]@{ Prefix = "8000::/1"; NextHop = $Config.TunIpv6Gateway }
+            )
+            $splitRoutesReady = $true
+            foreach ($route in $expectedRoutes) {
+                $found = $splitRoutes |
+                    Where-Object { $_.DestinationPrefix -eq $route.Prefix -and $_.InterfaceAlias -eq $Config.TunInterfaceAlias -and $_.NextHop -eq $route.NextHop } |
+                    Select-Object -First 1
+                if (-not $found) {
+                    $splitRoutesReady = $false
+                    break
+                }
+            }
+            $nrptNamespaces = @($nrptRules | ForEach-Object { $_.Namespace })
+            $requiredNrptReady = $true
+            foreach ($namespace in @($Config.NrptNamespaces)) {
+                if ($nrptNamespaces -notcontains $namespace) {
+                    $requiredNrptReady = $false
+                    break
+                }
+            }
+
+            if ($Mode -eq "Sanitized") {
+                $clashPathConfigured = -not [string]::IsNullOrWhiteSpace($Config.ClashPath)
+                $clashPathExists = if ($clashPathConfigured) { Test-Path -LiteralPath $Config.ClashPath } else { $false }
+                $diagLines = New-Object System.Collections.Generic.List[string]
+                $diagLines.Add(("=== 脱敏诊断摘要 {0} ===" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))) | Out-Null
+                $diagLines.Add("账号: $MaskedAccountValue") | Out-Null
+                $diagLines.Add("PPPoE: $($Config.RasEntry)") | Out-Null
+                $diagLines.Add("Proxy: $($Config.ProxyUrl)") | Out-Null
+                $diagLines.Add("TUN: $($Config.TunInterfaceAlias)") | Out-Null
+                $diagLines.Add(("ClashPathConfigured={0} ClashPathExists={1}" -f $clashPathConfigured, $clashPathExists)) | Out-Null
+                $diagLines.Add(("ras_connected={0}" -f $rasConnected)) | Out-Null
+                $diagLines.Add(("proxy_listening={0}" -f $proxyListening)) | Out-Null
+                $diagLines.Add(("tun_ready={0}" -f $tunReady)) | Out-Null
+                $diagLines.Add(("ethernet_candidate_ready={0}" -f $ethernetReady)) | Out-Null
+                $diagLines.Add(("state_file_exists={0}" -f $stateExists)) | Out-Null
+                $diagLines.Add(("auto_connect_task_enabled={0}" -f $taskSnapshot.Enabled)) | Out-Null
+                $diagLines.Add(("codex_nrpt_rule_count={0} required_nrpt_ready={1}" -f $nrptRules.Count, $requiredNrptReady)) | Out-Null
+                $diagLines.Add(("split_route_count={0} split_routes_ready={1}" -f $splitRoutes.Count, $splitRoutesReady)) | Out-Null
+                $diagLines.Add("不包含密码、日志全文、Clash 节点或本机完整路径。") | Out-Null
+                return New-StatusResult -Mode $Mode -SummaryText $summary -AutoConnectEnabled $taskSnapshot.Enabled -AutoConnectStatusText $taskSnapshot.Text -DiagnosticText ($diagLines -join [Environment]::NewLine) -HintText $hintText
+            }
+
+            $lines = New-Object System.Collections.Generic.List[string]
+            $lines.Add(("=== {0} {1} ===" -f $Label, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))) | Out-Null
+            $lines.Add($summary) | Out-Null
+            $lines.Add(("PPPoE: {0}" -f $Config.RasEntry)) | Out-Null
+            $lines.Add(("Proxy: {0}" -f $Config.ProxyUrl)) | Out-Null
+            $lines.Add(("TUN: {0}" -f $Config.TunInterfaceAlias)) | Out-Null
+            $lines.Add(("ClashPath: {0}" -f $Config.ClashPath)) | Out-Null
+            $lines.Add(("状态文件路径: {0}" -f $StatePathValue)) | Out-Null
+            $lines.Add($taskSnapshot.Text) | Out-Null
+            $lines.Add("--- rasdial ---") | Out-Null
+            $lines.Add($(if ([string]::IsNullOrWhiteSpace($rasRaw)) { "(no output)" } else { $rasRaw })) | Out-Null
+
+            $lines.Add("--- adapters ---") | Out-Null
+            $tunPattern = [regex]::Escape($Config.TunInterfaceAlias)
+            $adapters = $adapterObjects |
+                Where-Object { $_.Name -match "WLAN|Wi-?Fi|以太|Ethernet|Meta|Clash|TUN|$tunPattern" -or $_.InterfaceDescription -match "Wireless|Ethernet|Meta|Clash|TUN|$tunPattern" } |
+                Select-Object Name, InterfaceDescription, Status, LinkSpeed, ifIndex |
+                Out-String -Width 4096
+            $lines.Add($(if ([string]::IsNullOrWhiteSpace($adapters)) { "(none)" } else { $adapters.Trim() })) | Out-Null
+
+            $lines.Add("--- Clash listen ---") | Out-Null
+            $proc = Get-Process -Name $Config.ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($proc) {
+                $listen = Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
+                    Select-Object LocalAddress, LocalPort, State |
+                    Sort-Object LocalPort |
+                    Out-String -Width 4096
+                $lines.Add($(if ([string]::IsNullOrWhiteSpace($listen)) { "(none)" } else { $listen.Trim() })) | Out-Null
+            }
+            else {
+                $lines.Add("$($Config.ClashCoreProcessName) 未运行") | Out-Null
+            }
+
+            $nrpt = $nrptRules |
+                Select-Object Namespace, NameServers, Comment |
+                Out-String -Width 4096
+            $lines.Add("--- Codex NRPT ---") | Out-Null
+            $lines.Add($(if ([string]::IsNullOrWhiteSpace($nrpt)) { "(none)" } else { $nrpt.Trim() })) | Out-Null
+
+            $routes = $splitRoutes |
+                Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric, InterfaceMetric, AddressFamily |
+                Out-String -Width 4096
+            $lines.Add("--- Codex split routes ---") | Out-Null
+            $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
+
+            $lines.Add("--- logon auto-connect task ---") | Out-Null
+            $lines.Add($taskSnapshot.ActionText) | Out-Null
+            return New-StatusResult -Mode $Mode -SummaryText $summary -AutoConnectEnabled $taskSnapshot.Enabled -AutoConnectStatusText $taskSnapshot.Text -DetailText ($lines -join [Environment]::NewLine) -HintText $hintText
+        }
+        catch {
+            return New-StatusResult -Mode $Mode -SummaryText "状态读取失败: $($_.Exception.Message)" -AutoConnectEnabled $false -AutoConnectStatusText "登录后自动连接: 未检查" -ErrorText $_.Exception.Message
+        }
+    }
+    return $true
+}
+
+function Receive-StatusRefreshJob {
+    if ($null -eq $script:StatusJob -or $script:StatusJob.State -eq "Running") {
+        return
+    }
+
+    $state = $script:StatusJob.State
+    $results = @(Receive-Job -Job $script:StatusJob -ErrorAction SilentlyContinue)
+    Remove-Job -Job $script:StatusJob -Force -ErrorAction SilentlyContinue
+    $script:StatusJob = $null
+
+    $result = $results | Where-Object { $null -ne $_.PSObject.Properties["Mode"] } | Select-Object -Last 1
+    if ($state -ne "Completed" -or -not $result) {
+        Append-Output "状态刷新失败。"
+        return
+    }
+
+    Set-StateSummaryCache -Text $result.SummaryText -AutoConnectEnabled $result.AutoConnectEnabled -AutoConnectStatusText $result.AutoConnectStatusText
+    $statusLabel.Text = Get-StateSummary
+    if ($null -ne $result.AutoConnectEnabled) {
+        Set-AutoConnectChecked -Checked ([bool]$result.AutoConnectEnabled)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($result.Error)) {
+        Append-Output ("状态刷新失败: {0}" -f $result.Error)
+        return
+    }
+
+    if ($result.Mode -eq "Summary" -and -not [string]::IsNullOrWhiteSpace($result.HintText)) {
+        Append-Output ("提示:{0}{1}" -f [Environment]::NewLine, $result.HintText)
+    }
+
+    if ($result.Mode -eq "Detailed") {
+        Append-Output $result.DetailText
+        Append-Output ("状态刷新耗时: {0} ms" -f $result.DurationMs)
+    }
+    elseif ($result.Mode -eq "Sanitized") {
+        Append-Output $result.DiagnosticText
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($result.DiagnosticText)
+            Append-Output "脱敏诊断摘要已复制到剪贴板。"
+        }
+        catch {
+            Append-Output ("复制到剪贴板失败: {0}" -f $_.Exception.Message)
+        }
     }
 }
 
@@ -698,7 +1116,7 @@ function Start-BackendJob {
     $script:CurrentAction = $Action
     $script:CloseAfterSuccess = $false
     $script:SuccessSeenAt = $null
-    $script:LastJobOutputText = ""
+    $script:CurrentJobOutputBuffer = [System.Text.StringBuilder]::new()
     $actionTitle = switch ($Action) {
         "connect" { "修复 PPPoE + Clash" }
         "pppoeOnly" { "仅拨号有线 PPPoE" }
@@ -793,22 +1211,38 @@ $autoConnectBox.Add_CheckedChanged({
             Save-CurrentUiSettings
             Append-Output "已关闭登录后自动连接。"
         }
+        Set-StateSummaryCache -Text "登录后自动连接设置已更新，正在刷新状态..." -AutoConnectEnabled $autoConnectBox.Checked
         $statusLabel.Text = Get-StateSummary
+        Start-StatusRefreshJob -Mode "Summary" -Label "自启设置后刷新" | Out-Null
     }
     catch {
         $message = $_.Exception.Message
         Append-Output ("登录后自动连接设置失败: {0}" -f $message)
         [System.Windows.Forms.MessageBox]::Show($message, "登录后自动连接", "OK", "Warning") | Out-Null
-        Set-AutoConnectChecked -Checked ([bool](Get-AutoConnectTask))
+        $knownAutoState = if ($null -ne $script:StateSummaryCache.AutoConnectEnabled) { [bool]$script:StateSummaryCache.AutoConnectEnabled } else { $false }
+        Set-AutoConnectChecked -Checked $knownAutoState
         Save-CurrentUiSettings
+        Set-StateSummaryCache -Text "登录后自动连接设置失败，正在刷新状态..."
         $statusLabel.Text = Get-StateSummary
+        Start-StatusRefreshJob -Mode "Summary" -Label "自启设置失败后刷新" | Out-Null
     }
 })
 
 $refreshButton.Add_Click({
     Save-CurrentUiSettings
-    $statusLabel.Text = Get-StateSummary
-    Append-Output (Get-DetailedStatusText -Label "刷新状态")
+    Append-Output ("正在刷新详细状态... {0}" -f (Get-Date -Format "HH:mm:ss"))
+    if (-not (Start-StatusRefreshJob -Mode "Detailed" -Label "刷新状态")) {
+        Append-Output "已有状态刷新正在进行，请稍后。"
+    }
+})
+
+$diagButton.Add_Click({
+    Save-CurrentUiSettings
+    Append-Output ("正在生成脱敏诊断摘要... {0}" -f (Get-Date -Format "HH:mm:ss"))
+    $maskedAccount = Get-MaskedAccount -Account $accountBox.Text
+    if (-not (Start-StatusRefreshJob -Mode "Sanitized" -Label "脱敏诊断摘要" -MaskedAccount $maskedAccount)) {
+        Append-Output "已有状态刷新正在进行，请稍后。"
+    }
 })
 
 $connectButton.Add_Click({
@@ -866,20 +1300,30 @@ $restoreButton.Add_Click({
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 700
 $timer.Add_Tick({
+    Receive-StatusRefreshJob
+
     if ($null -ne $script:CurrentJob) {
-        $currentOutput = Receive-Job -Job $script:CurrentJob -Keep -ErrorAction SilentlyContinue | Out-String -Width 4096
-        if ($currentOutput.Length -gt $script:LastJobOutputText.Length -and $currentOutput.StartsWith($script:LastJobOutputText)) {
-            $newOutput = $currentOutput.Substring($script:LastJobOutputText.Length)
+        $newItems = @(Receive-Job -Job $script:CurrentJob -ErrorAction SilentlyContinue)
+        if ($newItems.Count -gt 0) {
+            $newOutput = ($newItems | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
             Append-Output $newOutput
-            $script:LastJobOutputText = $currentOutput
-        }
-        elseif ($currentOutput -ne $script:LastJobOutputText) {
-            Append-Output $currentOutput
-            $script:LastJobOutputText = $currentOutput
+            if ($null -eq $script:CurrentJobOutputBuffer) {
+                $script:CurrentJobOutputBuffer = [System.Text.StringBuilder]::new()
+            }
+            [void]$script:CurrentJobOutputBuffer.AppendLine($newOutput)
         }
 
         if ($script:CurrentJob.State -in @("Completed", "Failed", "Stopped")) {
-            $output = Receive-Job -Job $script:CurrentJob -Keep -ErrorAction SilentlyContinue | Out-String -Width 4096
+            $remainingItems = @(Receive-Job -Job $script:CurrentJob -ErrorAction SilentlyContinue)
+            if ($remainingItems.Count -gt 0) {
+                $remainingOutput = ($remainingItems | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+                Append-Output $remainingOutput
+                if ($null -eq $script:CurrentJobOutputBuffer) {
+                    $script:CurrentJobOutputBuffer = [System.Text.StringBuilder]::new()
+                }
+                [void]$script:CurrentJobOutputBuffer.AppendLine($remainingOutput)
+            }
+            $output = if ($null -ne $script:CurrentJobOutputBuffer) { $script:CurrentJobOutputBuffer.ToString() } else { "" }
             $state = $script:CurrentJob.State
             Remove-Job -Job $script:CurrentJob -Force -ErrorAction SilentlyContinue
             $script:CurrentJob = $null
@@ -891,7 +1335,16 @@ $timer.Add_Tick({
             }
             $success = ($state -eq "Completed" -and $output -match [regex]::Escape($successToken))
             if ($success) {
-                Append-Output (Get-DetailedStatusText -Label "操作完成后状态")
+                $successText = switch ($script:CurrentAction) {
+                    "connect" { "连接成功。" }
+                    "pppoeOnly" { "仅 PPPoE 拨号成功。" }
+                    "restore" { "已切换回 WLAN。" }
+                }
+                Set-StateSummaryCache -Text ($successText + " 正在后台刷新状态...")
+                $statusLabel.Text = Get-StateSummary
+                Set-ControlsBusy -Busy $false
+                Append-Output ($successText + " 详细状态将在后台刷新。")
+                Start-StatusRefreshJob -Mode "Detailed" -Label "操作完成后状态" | Out-Null
                 if ($autoCloseBox.Checked) {
                     $statusLabel.Text = switch ($script:CurrentAction) {
                         "connect" { "连接成功，窗口即将关闭。" }
@@ -902,9 +1355,7 @@ $timer.Add_Tick({
                     $script:SuccessSeenAt = Get-Date
                 }
                 else {
-                    $statusLabel.Text = Get-StateSummary
                     Append-Output "操作成功。窗口保持打开。"
-                    Set-ControlsBusy -Busy $false
                 }
             }
             else {
@@ -930,6 +1381,10 @@ $timer.Add_Tick({
 })
 $timer.Start()
 
+$form.Add_Shown({
+    Start-StatusRefreshJob -Mode "Summary" -Label "启动后状态" | Out-Null
+})
+
 $form.Add_FormClosing({
     if ($null -ne $script:CurrentJob -and $script:CurrentJob.State -eq "Running") {
         $answer = [System.Windows.Forms.MessageBox]::Show("操作仍在执行，确定要关闭窗口吗？", "确认关闭", "YesNo", "Warning")
@@ -937,6 +1392,10 @@ $form.Add_FormClosing({
             $_.Cancel = $true
             return
         }
+    }
+    if ($null -ne $script:StatusJob) {
+        Remove-Job -Job $script:StatusJob -Force -ErrorAction SilentlyContinue
+        $script:StatusJob = $null
     }
 })
 

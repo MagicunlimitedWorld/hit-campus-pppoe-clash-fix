@@ -14,7 +14,7 @@
         "D:\clash verge\clash-verge.exe"
     )
     NrptNamespaces = @(".openai.com", ".chatgpt.com", ".oaistatic.com", ".oaiusercontent.com", ".github.com")
-    EthernetNamePatterns = @("Ethernet", "以太网", "Realtek PCIe", "Intel(R) Ethernet")
+    EthernetNamePatterns = @("Ethernet", "以太网", "Realtek PCIe", "Realtek USB", "USB Ethernet", "Intel(R) Ethernet")
 }
 
 function ConvertTo-HitNetStringArray {

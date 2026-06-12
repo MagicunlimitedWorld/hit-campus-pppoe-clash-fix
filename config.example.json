@@ -24,6 +24,8 @@
     "Ethernet",
     "以太网",
     "Realtek PCIe",
+    "Realtek USB",
+    "USB Ethernet",
     "Intel(R) Ethernet"
   ]
 }

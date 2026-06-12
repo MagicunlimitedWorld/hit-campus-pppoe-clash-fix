@@ -38,7 +38,7 @@ Start-HitNetClashFix.cmd
 切换回 WLAN：
 
 1. 再次双击 `Start-HitNetClashFix.cmd`。
-2. 点击“一键切换回 WLAN”。
+2. 点击“切回 WLAN”。
 
 登录后自动连接：
 
@@ -46,7 +46,16 @@ Start-HitNetClashFix.cmd
 2. 勾选“登录后自动连接”。
 3. 之后当前 Windows 用户登录后，工具会自动启动/等待 Clash，并连接有线 PPPoE + Clash。
 
-下方输出框会显示状态、预检结果、拨号过程和恢复过程。默认成功后窗口保持打开；需要自动退出时可勾选“成功后自动关闭”。
+下方输出框会显示状态、预检结果、拨号过程和恢复过程。默认成功后窗口保持打开；需要自动退出时可勾选“成功后自动关闭”。“刷新状态”和“复制脱敏诊断”都是只读操作，不会拨号、删路由或修改 Clash。
+
+### 第一次使用检查清单
+
+1. Clash Verge 已启动，且 TUN/Meta 已在 Clash 中开启。
+2. UI 顶部显示 Clash 代理端口已监听；若未监听，先检查代理地址和端口。
+3. PPPoE 名称与 Windows 宽带连接名称一致，HIT 常见为 `HITnet`。
+4. TUN 网卡名与系统中的 Clash TUN 适配器一致，默认通常为 `Meta`。
+5. Clash 路径存在；若自动识别失败，点击“浏览”选择 `clash-verge.exe`。
+6. 遇到问题时先点“复制脱敏诊断”，再把摘要发给维护者；摘要不包含密码、日志全文或 Clash 节点。
 
 ## 可迁移配置
 
@@ -59,6 +68,14 @@ Start-HitNetClashFix.cmd
 - `NrptNamespaces`：需要定向到 Clash DNS 的域名后缀
 
 本机实际设置保存在 `.local/settings.json`，不会上传 GitHub。UI 中可直接修改 PPPoE 名称、代理地址、TUN 网卡名和 Clash 路径。
+
+其他 HIT 用户通常只需要核对这几项：
+
+- PPPoE 名称：Windows 中宽带连接名称不是 `HITnet` 时修改。
+- Clash 代理端口：Clash 本机端口不是 `7897` 时修改。
+- TUN 网卡名：Clash TUN 不叫 `Meta` 时修改。
+- Clash 路径：自动识别不到 Clash Verge 安装位置时手动选择。
+- 有线网卡候选名：状态栏一直显示有线未就绪，但实际已插线时，在本地配置中补充 `EthernetNamePatterns`。
 
 ## 文件说明
 
