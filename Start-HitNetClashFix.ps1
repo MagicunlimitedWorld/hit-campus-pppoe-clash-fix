@@ -13,7 +13,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $EnterScript = Join-Path $ScriptDir "enter_pppoe_codex.ps1"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
+$AutoConnectScript = Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$AutoConnectTaskName = "HitCampusPppoeClashAutoConnect"
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
 $RuntimeMarkerDir = Join-Path $RuntimeDir "markers"
@@ -97,6 +99,7 @@ function Get-AppSettings {
         RememberPassword = $false
         PasswordProtected = ""
         AutoCloseOnSuccess = $false
+        AutoConnectOnLogon = $false
         RasEntry = $script:CurrentConfig.RasEntry
         ProxyUrl = $script:CurrentConfig.ProxyUrl
         TunInterfaceAlias = $script:CurrentConfig.TunInterfaceAlias
@@ -117,6 +120,7 @@ function Get-AppSettings {
             RememberPassword = [bool]$settings.RememberPassword
             PasswordProtected = [string]$settings.PasswordProtected
             AutoCloseOnSuccess = [bool]$settings.AutoCloseOnSuccess
+            AutoConnectOnLogon = [bool]$settings.AutoConnectOnLogon
             RasEntry = $script:CurrentConfig.RasEntry
             ProxyUrl = $script:CurrentConfig.ProxyUrl
             TunInterfaceAlias = $script:CurrentConfig.TunInterfaceAlias
@@ -137,6 +141,7 @@ function Save-AppSettings {
         [bool]$RememberAccount,
         [bool]$RememberPassword,
         [bool]$AutoCloseOnSuccess,
+        [bool]$AutoConnectOnLogon,
         [string]$RasEntryValue,
         [string]$ProxyUrlValue,
         [string]$TunInterfaceAliasValue,
@@ -161,6 +166,7 @@ function Save-AppSettings {
         RememberPassword = $RememberPassword
         PasswordProtected = $protectedPassword
         AutoCloseOnSuccess = $AutoCloseOnSuccess
+        AutoConnectOnLogon = $AutoConnectOnLogon
         RasEntry = $RasEntryValue
         ProxyUrl = $ProxyUrlValue
         TunInterfaceAlias = $TunInterfaceAliasValue
@@ -242,6 +248,61 @@ function Get-EthernetReady {
     return [bool]$adapter
 }
 
+function Get-AutoConnectTask {
+    try {
+        return Get-ScheduledTask -TaskName $AutoConnectTaskName -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-AutoConnectTaskActionArguments {
+    param([string]$SettingsPathValue = $SettingsPath)
+    return '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -SettingsPath {1}' -f (Quote-Arg $AutoConnectScript), (Quote-Arg $SettingsPathValue)
+}
+
+function Get-AutoConnectTaskStatusText {
+    $task = Get-AutoConnectTask
+    if (-not $task) {
+        return "登录后自动连接: 未启用"
+    }
+
+    try {
+        $info = Get-ScheduledTaskInfo -TaskName $AutoConnectTaskName -ErrorAction Stop
+        return "登录后自动连接: 已启用 State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
+    }
+    catch {
+        return "登录后自动连接: 已启用 State=$($task.State)"
+    }
+}
+
+function Register-AutoConnectTask {
+    if (-not (Test-Path -LiteralPath $AutoConnectScript)) {
+        throw "自动连接脚本不存在: $AutoConnectScript"
+    }
+
+    $powershellExe = Join-Path $PSHOME "powershell.exe"
+    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument (Get-AutoConnectTaskActionArguments)
+    $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    try {
+        $trigger.Delay = "PT30S"
+    }
+    catch {
+    }
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
+    $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $AutoConnectTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description "Logon auto-connect for HIT PPPoE plus Clash." -Force | Out-Null
+}
+
+function Unregister-AutoConnectTask {
+    $task = Get-AutoConnectTask
+    if ($task) {
+        Unregister-ScheduledTask -TaskName $AutoConnectTaskName -Confirm:$false
+    }
+}
+
 function Get-StateSummary {
     $cfg = Get-UiConfig
     $rasText = if (Get-RasConnected -EntryName $cfg.RasEntry) { "$($cfg.RasEntry): 已连接" } else { "$($cfg.RasEntry): 未连接" }
@@ -249,7 +310,8 @@ function Get-StateSummary {
     $tunText = if (Get-TunReady -Alias $cfg.TunInterfaceAlias) { "TUN: 已就绪" } else { "TUN: 未就绪" }
     $ethText = if (Get-EthernetReady) { "有线: 已连接" } else { "有线: 未就绪" }
     $stateText = if (Test-Path -LiteralPath $StatePath) { "状态文件: 存在" } else { "状态文件: 无" }
-    return "$rasText    $clashText    $tunText    $ethText    $stateText"
+    $autoText = if (Get-AutoConnectTask) { "自启: 已启用" } else { "自启: 未启用" }
+    return "$rasText    $clashText    $tunText    $ethText    $stateText    $autoText"
 }
 
 function Get-DetailedStatusText {
@@ -264,6 +326,7 @@ function Get-DetailedStatusText {
     $lines.Add(("TUN: {0}" -f $cfg.TunInterfaceAlias)) | Out-Null
     $lines.Add(("ClashPath: {0}" -f $cfg.ClashPath)) | Out-Null
     $lines.Add(("状态文件路径: {0}" -f $StatePath)) | Out-Null
+    $lines.Add((Get-AutoConnectTaskStatusText)) | Out-Null
 
     $ras = (& rasdial.exe 2>&1 | Out-String).Trim()
     $lines.Add("--- rasdial ---") | Out-Null
@@ -302,6 +365,16 @@ function Get-DetailedStatusText {
         Out-String -Width 4096
     $lines.Add("--- Codex split routes ---") | Out-Null
     $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
+
+    $lines.Add("--- logon auto-connect task ---") | Out-Null
+    $task = Get-AutoConnectTask
+    if ($task) {
+        $taskActions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
+        $lines.Add($taskActions) | Out-Null
+    }
+    else {
+        $lines.Add("(not registered)") | Out-Null
+    }
     return ($lines -join [Environment]::NewLine)
 }
 
@@ -320,11 +393,11 @@ function Invoke-SelfTest {
     $testPath = Join-Path $ScriptDir ".local\selftest.settings.json"
     $script:SettingsPath = $testPath
     $secure = ConvertTo-SecureString "selftest-password" -AsPlainText -Force
-    Save-AppSettings -Account "selftest-account" -Password $secure -RememberAccount $true -RememberPassword $true -AutoCloseOnSuccess $true -RasEntryValue "SelfTestRas" -ProxyUrlValue "http://127.0.0.1:18080" -TunInterfaceAliasValue "SelfTestTun" -TunIpv4GatewayValue "198.18.0.2" -TunIpv6GatewayValue "fdfe:dcba:9876::2" -ClashPathValue "C:\SelfTest\clash-verge.exe"
+    Save-AppSettings -Account "selftest-account" -Password $secure -RememberAccount $true -RememberPassword $true -AutoCloseOnSuccess $true -AutoConnectOnLogon $true -RasEntryValue "SelfTestRas" -ProxyUrlValue "http://127.0.0.1:18080" -TunInterfaceAliasValue "SelfTestTun" -TunIpv4GatewayValue "198.18.0.2" -TunIpv6GatewayValue "fdfe:dcba:9876::2" -ClashPathValue "C:\SelfTest\clash-verge.exe"
     $script:CurrentConfig = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $testPath
     $loaded = Get-AppSettings
     $plain = ConvertTo-PlainTextFromProtectedText -ProtectedText $loaded.PasswordProtected
-    if (-not $loaded.RememberAccount -or $loaded.Account -ne "selftest-account" -or $plain -ne "selftest-password" -or -not $loaded.AutoCloseOnSuccess) {
+    if (-not $loaded.RememberAccount -or $loaded.Account -ne "selftest-account" -or $plain -ne "selftest-password" -or -not $loaded.AutoCloseOnSuccess -or -not $loaded.AutoConnectOnLogon) {
         throw "SelfTest settings roundtrip failed."
     }
     if ($loaded.RasEntry -ne "SelfTestRas" -or $loaded.ProxyUrl -ne "http://127.0.0.1:18080" -or $loaded.TunInterfaceAlias -ne "SelfTestTun") {
@@ -333,6 +406,10 @@ function Invoke-SelfTest {
     $statusText = Get-DetailedStatusText -Label "SelfTest"
     if ([string]::IsNullOrWhiteSpace($statusText) -or $statusText -notmatch "rasdial" -or $statusText -notmatch "Codex split routes") {
         throw "SelfTest detailed status output failed."
+    }
+    $taskArgs = Get-AutoConnectTaskActionArguments -SettingsPathValue $testPath
+    if ($taskArgs -notmatch "auto_connect_pppoe_clash\.ps1" -or $taskArgs -notmatch [regex]::Escape($testPath) -or $taskArgs -match "selftest-password") {
+        throw "SelfTest auto-connect task command failed."
     }
     foreach ($runtimePath in @($RuntimeLogDir, $RuntimeMarkerDir, $RuntimeStateDir)) {
         if ([string]::IsNullOrWhiteSpace($runtimePath)) {
@@ -442,11 +519,18 @@ $rememberPasswordBox.Checked = [bool]$settings.RememberPassword
 $loginGroup.Controls.Add($rememberPasswordBox)
 
 $autoCloseBox = [System.Windows.Forms.CheckBox]::new()
-$autoCloseBox.Location = [System.Drawing.Point]::new(510, 43)
+$autoCloseBox.Location = [System.Drawing.Point]::new(510, 28)
 $autoCloseBox.Size = [System.Drawing.Size]::new(150, 24)
 $autoCloseBox.Text = "成功后自动关闭"
 $autoCloseBox.Checked = [bool]$settings.AutoCloseOnSuccess
 $loginGroup.Controls.Add($autoCloseBox)
+
+$autoConnectBox = [System.Windows.Forms.CheckBox]::new()
+$autoConnectBox.Location = [System.Drawing.Point]::new(510, 60)
+$autoConnectBox.Size = [System.Drawing.Size]::new(180, 24)
+$autoConnectBox.Text = "登录后自动连接"
+$autoConnectBox.Checked = [bool](Get-AutoConnectTask)
+$loginGroup.Controls.Add($autoConnectBox)
 
 $pppoeLabel = [System.Windows.Forms.Label]::new()
 $pppoeLabel.Location = [System.Drawing.Point]::new(18, 30)
@@ -544,10 +628,11 @@ $script:CurrentAction = ""
 $script:CloseAfterSuccess = $false
 $script:SuccessSeenAt = $null
 $script:LastJobOutputText = ""
+$script:SuppressAutoConnectChange = $false
 
 function Set-ControlsBusy {
     param([bool]$Busy)
-    foreach ($control in @($connectButton, $restoreButton, $refreshButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
+    foreach ($control in @($connectButton, $restoreButton, $refreshButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $autoConnectBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
         $control.Enabled = -not $Busy
     }
 }
@@ -556,6 +641,17 @@ function Append-Output {
     param([string]$Text)
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         $outputBox.AppendText($Text.TrimEnd() + [Environment]::NewLine)
+    }
+}
+
+function Set-AutoConnectChecked {
+    param([bool]$Checked)
+    $script:SuppressAutoConnectChange = $true
+    try {
+        $autoConnectBox.Checked = $Checked
+    }
+    finally {
+        $script:SuppressAutoConnectChange = $false
     }
 }
 
@@ -568,7 +664,7 @@ function Save-CurrentUiSettings {
     }
 
     $cfg = Get-UiConfig
-    Save-AppSettings -Account $accountBox.Text.Trim() -Password $securePassword -RememberAccount $rememberAccountBox.Checked -RememberPassword $rememberPasswordBox.Checked -AutoCloseOnSuccess $autoCloseBox.Checked -RasEntryValue $cfg.RasEntry -ProxyUrlValue $cfg.ProxyUrl -TunInterfaceAliasValue $cfg.TunInterfaceAlias -TunIpv4GatewayValue $cfg.TunIpv4Gateway -TunIpv6GatewayValue $cfg.TunIpv6Gateway -ClashPathValue $cfg.ClashPath
+    Save-AppSettings -Account $accountBox.Text.Trim() -Password $securePassword -RememberAccount $rememberAccountBox.Checked -RememberPassword $rememberPasswordBox.Checked -AutoCloseOnSuccess $autoCloseBox.Checked -AutoConnectOnLogon $autoConnectBox.Checked -RasEntryValue $cfg.RasEntry -ProxyUrlValue $cfg.ProxyUrl -TunInterfaceAliasValue $cfg.TunInterfaceAlias -TunIpv4GatewayValue $cfg.TunIpv4Gateway -TunIpv6GatewayValue $cfg.TunIpv6Gateway -ClashPathValue $cfg.ClashPath
     $script:CurrentConfig = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $cfg.RasEntry -ProxyUrl $cfg.ProxyUrl -TunInterfaceAlias $cfg.TunInterfaceAlias -TunIpv4Gateway $cfg.TunIpv4Gateway -TunIpv6Gateway $cfg.TunIpv6Gateway -ClashPath $cfg.ClashPath
 }
 
@@ -619,6 +715,50 @@ $browseButton.Add_Click({
     }
     if ($dialog.ShowDialog() -eq "OK") {
         $script:ClashPathBox.Text = $dialog.FileName
+    }
+})
+
+$autoConnectBox.Add_CheckedChanged({
+    if ($script:SuppressAutoConnectChange) {
+        return
+    }
+
+    try {
+        if ($autoConnectBox.Checked) {
+            if (-not $rememberAccountBox.Checked -or -not $rememberPasswordBox.Checked) {
+                throw "请先勾选'记住账号'和'记住密码'。"
+            }
+            if ([string]::IsNullOrWhiteSpace($accountBox.Text) -or [string]::IsNullOrWhiteSpace($passwordBox.Text)) {
+                throw "请先填写校园网账号和密码。"
+            }
+            if ([string]::IsNullOrWhiteSpace($script:RasEntryBox.Text) -or [string]::IsNullOrWhiteSpace($script:ProxyUrlBox.Text) -or [string]::IsNullOrWhiteSpace($script:TunAliasBox.Text)) {
+                throw "请先填写 PPPoE 名称、代理地址和 TUN 网卡名。"
+            }
+
+            Save-CurrentUiSettings
+            $validateOutput = (& $AutoConnectScript -SettingsPath $SettingsPath -ValidateOnly 2>&1 | Out-String -Width 4096).Trim()
+            if ($validateOutput -notmatch "AUTO_CONNECT_VALIDATE_OK") {
+                throw ("自动连接验证失败。{0}" -f $validateOutput)
+            }
+
+            Register-AutoConnectTask
+            Save-CurrentUiSettings
+            Append-Output "已启用登录后自动连接。任务将在当前 Windows 用户登录后延迟约 30 秒运行。"
+        }
+        else {
+            Unregister-AutoConnectTask
+            Save-CurrentUiSettings
+            Append-Output "已关闭登录后自动连接。"
+        }
+        $statusLabel.Text = Get-StateSummary
+    }
+    catch {
+        $message = $_.Exception.Message
+        Append-Output ("登录后自动连接设置失败: {0}" -f $message)
+        [System.Windows.Forms.MessageBox]::Show($message, "登录后自动连接", "OK", "Warning") | Out-Null
+        Set-AutoConnectChecked -Checked ([bool](Get-AutoConnectTask))
+        Save-CurrentUiSettings
+        $statusLabel.Text = Get-StateSummary
     }
 })
 

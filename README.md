@@ -32,6 +32,12 @@ Start-HitNetClashFix.cmd
 1. 再次双击 `Start-HitNetClashFix.cmd`。
 2. 点击“一键切换回 WLAN”。
 
+登录后自动连接：
+
+1. 在 UI 中勾选“记住账号”和“记住密码”。
+2. 勾选“登录后自动连接”。
+3. 之后当前 Windows 用户登录后，工具会自动启动/等待 Clash，并连接有线 PPPoE + Clash。
+
 下方输出框会显示状态、预检结果、拨号过程和恢复过程。默认成功后窗口保持打开；需要自动退出时可勾选“成功后自动关闭”。
 
 ## 可迁移配置
@@ -53,6 +59,7 @@ Start-HitNetClashFix.cmd
 - `HitNetClashConfig.ps1`：共享配置读取与自动探测逻辑。
 - `config.example.json`：公开模板配置。
 - `enter_pppoe_codex.ps1`：一键修复并连接有线 PPPoE + Clash。
+- `auto_connect_pppoe_clash.ps1`：登录后自动连接入口。
 - `restore_wlan_clash.ps1`：恢复 WLAN + Clash。
 - `diagnostics/pppoe_clash_test_and_restore.ps1`：诊断和受控测试脚本。
 
@@ -61,6 +68,7 @@ Start-HitNetClashFix.cmd
 - 默认不保存账号和密码。
 - “记住账号”会保存到 `.local/settings.json`。
 - “记住密码”使用 Windows DPAPI 加密，只能由当前 Windows 用户解密。
+- “登录后自动连接”使用 Windows 计划任务触发，不会把账号密码写入任务参数或日志。
 - 日志、done marker、状态文件都放在 `.runtime/` 下。
 - `.local/` 和 `.runtime/` 已加入 `.gitignore`，不会上传 GitHub。
 
@@ -102,6 +110,7 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 - 不关闭 WLAN。
 - 不修改 Clash 配置。
 - 不自动开启 Clash TUN。
+- 不在 Windows 用户登录前解密或使用密码。
 - 不修改 DNS、MTU 或系统代理的永久配置。
 - 不上传日志、运行状态、Clash 配置备份、`.runtime/` 或 `.local/` 本地凭据。
 
