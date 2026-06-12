@@ -6,8 +6,10 @@
     [string]$TunIpv6Gateway,
     [string]$SettingsPath,
     [switch]$SkipProbe,
-    [int]$ProbeAttempts = 3,
+    [int]$ProbeAttempts = 1,
     [int]$ProbeRetryDelaySeconds = 3,
+    [ValidateSet("Balanced", "Full", "Minimal")]
+    [string]$ProbeMode = "Balanced",
     [string]$Reason = "manual restore"
 )
 
@@ -136,45 +138,106 @@ function Remove-StateFile {
     }
 }
 
+function Test-CodexNrptRemoved {
+    $rules = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Comment -like "CodexClashEnter*" -or
+            $_.DisplayName -like "CodexClashEnter*" -or
+            $_.Comment -like "CodexClashTrial*" -or
+            $_.DisplayName -like "CodexClashTrial*"
+        }
+    return (-not $rules)
+}
+
+function Test-CodexSplitRoutesRemoved {
+    $routes = @(
+        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway },
+        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway },
+        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway },
+        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway }
+    )
+    $routeTable = @(Get-NetRoute -DestinationPrefix ($routes.Prefix) -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
+
+    foreach ($route in $routes) {
+        $found = $routeTable |
+            Where-Object { $_.DestinationPrefix -eq $route.Prefix -and $_.NextHop -eq $route.NextHop } |
+            Select-Object -First 1
+        if ($found) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-RasDisconnected {
+    $status = (& rasdial.exe 2>&1 | Out-String)
+    return ($status -notmatch [regex]::Escape($RasEntry))
+}
+
+function Wait-RestoreSettled {
+    Invoke-Logged "wait restore state settled" {
+        for ($i = 0; $i -lt 6; $i++) {
+            $nrptRemoved = Test-CodexNrptRemoved
+            $routesRemoved = Test-CodexSplitRoutesRemoved
+            $rasDisconnected = Test-RasDisconnected
+            "attempt=$i nrpt_removed=$nrptRemoved split_routes_removed=$routesRemoved ras_disconnected=$rasDisconnected"
+            if ($nrptRemoved -and $routesRemoved -and $rasDisconnected) {
+                return
+            }
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
 function Write-FinalSnapshot {
-    Invoke-Logged "final RAS status" {
-        & rasdial.exe
+    Invoke-Logged "final restore status" {
+        "ras_disconnected={0}" -f (Test-RasDisconnected)
+        "nrpt_removed={0}" -f (Test-CodexNrptRemoved)
+        "split_routes_removed={0}" -f (Test-CodexSplitRoutesRemoved)
     }
-    Invoke-Logged "final default and split routes" {
-        Get-NetRoute -DestinationPrefix "0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
-            Sort-Object AddressFamily, DestinationPrefix, RouteMetric, InterfaceMetric |
-            Select-Object DestinationPrefix, NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric, AddressFamily |
-            Format-Table -AutoSize
-    }
-    Invoke-Logged "final NRPT rules" {
-        Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Comment -like "CodexClashEnter*" -or
-                $_.DisplayName -like "CodexClashEnter*" -or
-                $_.Comment -like "CodexClashTrial*" -or
-                $_.DisplayName -like "CodexClashTrial*"
-            } |
-            Select-Object Name, Namespace, NameServers, Comment |
-            Format-Table -AutoSize
-    }
-    Invoke-Logged "final Clash listen" {
-        $proc = Get-Process -Name $ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($proc) {
-            $proc | Select-Object Id, ProcessName, Path | Format-List
-            Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
-                Select-Object LocalAddress, LocalPort, State |
-                Sort-Object LocalPort |
+
+    if ($ProbeMode -eq "Full") {
+        Invoke-Logged "final RAS status" {
+            & rasdial.exe
+        }
+        Invoke-Logged "final default and split routes" {
+            Get-NetRoute -DestinationPrefix "0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
+                Sort-Object AddressFamily, DestinationPrefix, RouteMetric, InterfaceMetric |
+                Select-Object DestinationPrefix, NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric, AddressFamily |
                 Format-Table -AutoSize
         }
-        else {
-            "$ClashCoreProcessName not found"
+        Invoke-Logged "final NRPT rules" {
+            Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Comment -like "CodexClashEnter*" -or
+                    $_.DisplayName -like "CodexClashEnter*" -or
+                    $_.Comment -like "CodexClashTrial*" -or
+                    $_.DisplayName -like "CodexClashTrial*"
+                } |
+                Select-Object Name, Namespace, NameServers, Comment |
+                Format-Table -AutoSize
+        }
+        Invoke-Logged "final Clash listen" {
+            $proc = Get-Process -Name $ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($proc) {
+                $proc | Select-Object Id, ProcessName, Path | Format-List
+                Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
+                    Select-Object LocalAddress, LocalPort, State |
+                    Sort-Object LocalPort |
+                    Format-Table -AutoSize
+            }
+            else {
+                "$ClashCoreProcessName not found"
+            }
         }
     }
-    if (-not $SkipProbe) {
+
+    if (-not $SkipProbe -and $ProbeMode -ne "Minimal") {
         Invoke-Logged "final Clash proxy OpenAI probe" {
-            $attempts = [Math]::Max(1, $ProbeAttempts)
+            $attempts = if ($ProbeMode -eq "Full") { [Math]::Max(3, $ProbeAttempts) } else { [Math]::Max(1, $ProbeAttempts) }
             for ($attempt = 1; $attempt -le $attempts; $attempt++) {
-                $result = & curl.exe -I -L --max-time 12 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
+                $result = & curl.exe -I -L --connect-timeout 3 --max-time 8 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
                 "attempt $attempt/$attempts $result"
                 if ($result -match "code=(?!000)\d{3}") {
                     "PROXY_PROBE_OK"
@@ -187,17 +250,21 @@ function Write-FinalSnapshot {
             "PROXY_PROBE_FAILED_AFTER_${attempts}_ATTEMPTS"
         }
     }
+    elseif ($ProbeMode -eq "Minimal") {
+        Write-Log "ProbeMode=Minimal; skip OpenAI proxy probe."
+    }
 }
 
 Write-Log ("LogPath={0}" -f $LogPath)
 Write-Log ("Reason={0}" -f $Reason)
 Write-Log ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2}" -f $RasEntry, $ProxyUrl, $TunInterfaceAlias)
+Write-Log ("ProbeMode={0}" -f $ProbeMode)
 Write-Log "Purpose=restore WLAN plus Clash by removing Codex PPPoE temporary networking changes."
 
 Remove-CodexNrptRules
 Remove-CodexSplitRoutes
 Disconnect-RasIfNeeded
 Remove-StateFile
-Start-Sleep -Seconds 5
+Wait-RestoreSettled
 Write-FinalSnapshot
 Write-Log "RESTORE_WLAN_CLASH_DONE"

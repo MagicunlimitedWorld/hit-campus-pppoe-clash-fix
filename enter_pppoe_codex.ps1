@@ -11,6 +11,8 @@
     [int]$WatchdogTimeoutSeconds = 180,
     [int]$ConnectAttempts = 2,
     [int]$ConnectRetryDelaySeconds = 10,
+    [ValidateSet("Balanced", "Full", "Minimal")]
+    [string]$ProbeMode = "Balanced",
     [switch]$SkipPreRestore
 )
 
@@ -181,24 +183,160 @@ function PreRestore {
         return
     }
 
-    if (-not (Test-Path -LiteralPath $RestoreScript)) {
-        throw "Restore script not found: $RestoreScript"
+    Invoke-Logged "pre-clean stale Codex NRPT rules without disconnecting RAS" {
+        $rules = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Comment -like "CodexClashEnter*" -or
+                $_.DisplayName -like "CodexClashEnter*" -or
+                $_.Comment -like "CodexClashTrial*" -or
+                $_.DisplayName -like "CodexClashTrial*"
+            }
+
+        foreach ($rule in $rules) {
+            "Removing NRPT rule: Name=$($rule.Name) Namespace=$($rule.Namespace -join ',')"
+            Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    Invoke-Logged "pre-restore stale Codex networking changes" {
-        & $RestoreScript -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -SkipProbe -Reason "enter pre-clean"
+    Invoke-Logged "pre-clean stale Codex split routes without disconnecting RAS" {
+        foreach ($prefix in @("0.0.0.0/1", "128.0.0.0/1")) {
+            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv4Gateway -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    "Removing IPv4 split route: $($_.DestinationPrefix) via $($_.NextHop)"
+                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                }
+        }
+
+        foreach ($prefix in @("::/1", "8000::/1")) {
+            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv6Gateway -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    "Removing IPv6 split route: $($_.DestinationPrefix) via $($_.NextHop)"
+                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                }
+        }
+    }
+
+    Invoke-Logged "pre-clean active state file" {
+        if (Test-Path -LiteralPath $StatePath) {
+            Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
+            "Removed $StatePath"
+        }
+        else {
+            "State file not found: $StatePath"
+        }
     }
 }
 
 function Test-ProxyPortListening {
     try {
         $uri = [Uri]$ProxyUrl
-        $listeners = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -in @($uri.Host, "127.0.0.1", "0.0.0.0", "::", "::1") }
-        return [bool]$listeners
+        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
+            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
+                return $false
+            }
+            $client.EndConnect($async)
+            return $true
+        }
+        finally {
+            $client.Close()
+        }
     }
     catch {
         return $false
+    }
+}
+
+function Test-RasConnected {
+    $status = (& rasdial.exe 2>&1 | Out-String)
+    return ($status -match [regex]::Escape($RasEntry))
+}
+
+function Test-TunInterfaceReady {
+    $adapter = Get-NetAdapter -Name $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+    return ($adapter -and $adapter.Status -eq "Up")
+}
+
+function Test-NrptRulesReady {
+    $rules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+        Where-Object { @($_.NameServers) -contains "198.18.0.2" })
+
+    foreach ($namespace in $NrptNamespaces) {
+        $rule = $rules |
+            Where-Object { @($_.Namespace) -contains $namespace } |
+            Select-Object -First 1
+        if (-not $rule) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-SplitRoutesReady {
+    $routes = @(
+        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway },
+        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway },
+        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway },
+        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway }
+    )
+    $routeTable = @(Get-NetRoute -DestinationPrefix ($routes.Prefix) -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
+
+    foreach ($route in $routes) {
+        $found = $routeTable |
+            Where-Object { $_.DestinationPrefix -eq $route.Prefix -and $_.NextHop -eq $route.NextHop } |
+            Select-Object -First 1
+        if (-not $found) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-EnterReady {
+    return (
+        (Test-RasConnected) -and
+        (Test-ProxyPortListening) -and
+        (Test-TunInterfaceReady) -and
+        (Test-NrptRulesReady) -and
+        (Test-SplitRoutesReady)
+    )
+}
+
+function Capture-ExistingEnterState {
+    $CreatedNrptRuleNames.Clear()
+    $AddedRoutes.Clear()
+
+    foreach ($namespace in $NrptNamespaces) {
+        $rule = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.Namespace -contains $namespace -or $_.Namespace -eq $namespace) -and
+                ($_.NameServers -contains "198.18.0.2" -or $_.NameServers -eq "198.18.0.2")
+            } |
+            Select-Object -First 1
+        if ($rule -and $rule.Name) {
+            $CreatedNrptRuleNames.Add($rule.Name) | Out-Null
+        }
+    }
+
+    foreach ($route in @(
+        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway; Family = "IPv4" },
+        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway; Family = "IPv4" },
+        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway; Family = "IPv6" },
+        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway; Family = "IPv6" }
+    )) {
+        $found = Get-NetRoute -DestinationPrefix $route.Prefix -InterfaceAlias $TunInterfaceAlias -NextHop $route.NextHop -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($found) {
+            $AddedRoutes.Add([pscustomobject]@{
+                DestinationPrefix = $route.Prefix
+                InterfaceIndex = $found.InterfaceIndex
+                NextHop = $route.NextHop
+                AddressFamily = $route.Family
+            }) | Out-Null
+        }
     }
 }
 
@@ -293,6 +431,11 @@ function Initialize-ColdStartPrerequisites {
 function Connect-Ras {
     param([pscredential]$Cred)
 
+    if (Test-RasConnected) {
+        Write-Log ("RAS entry {0} is already connected; skip dialing." -f $RasEntry)
+        return
+    }
+
     $attempts = [Math]::Max(1, $ConnectAttempts)
     $lastOutput = ""
     for ($attempt = 1; $attempt -le $attempts; $attempt++) {
@@ -312,11 +455,12 @@ function Connect-Ras {
             $plainPassword = $null
         }
 
-        Start-Sleep -Seconds 8
-        $status = (& rasdial.exe 2>&1 | Out-String)
-        if ($status -match [regex]::Escape($RasEntry)) {
-            Write-Log ("RAS entry {0} connected on attempt {1}." -f $RasEntry, $attempt)
-            return
+        for ($i = 0; $i -lt 12; $i++) {
+            if (Test-RasConnected) {
+                Write-Log ("RAS entry {0} connected on attempt {1} after {2}s." -f $RasEntry, $attempt, $i)
+                return
+            }
+            Start-Sleep -Seconds 1
         }
 
         Write-Log (Get-RasFailureHint -RasOutput $lastOutput)
@@ -454,52 +598,187 @@ function Save-State {
     $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatePath -Encoding UTF8
 }
 
+function Start-OpenAiHeadProbe {
+    param(
+        [string]$Label,
+        [switch]$UseProxy
+    )
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $true
+    if ($UseProxy) {
+        $handler.UseProxy = $true
+        $handler.Proxy = [System.Net.WebProxy]::new($ProxyUrl)
+    }
+    else {
+        $handler.UseProxy = $false
+    }
+
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(8)
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, "https://api.openai.com/v1/models")
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $task = $client.SendAsync($request)
+
+    return [pscustomobject]@{
+        Label = $Label
+        Client = $client
+        Request = $request
+        Task = $task
+        Stopwatch = $watch
+    }
+}
+
+function Complete-OpenAiHeadProbe {
+    param([pscustomobject]$Probe)
+
+    try {
+        if (-not $Probe.Task.Wait(8000)) {
+            throw "timeout"
+        }
+
+        $Probe.Stopwatch.Stop()
+        $response = $Probe.Task.Result
+        try {
+            return [pscustomobject]@{
+                Label = $Probe.Label
+                Code = [int]$response.StatusCode
+                TotalSeconds = $Probe.Stopwatch.Elapsed.TotalSeconds
+                Error = ""
+            }
+        }
+        finally {
+            $response.Dispose()
+        }
+    }
+    catch {
+        $Probe.Stopwatch.Stop()
+        $err = $_.Exception
+        if ($err.InnerException) {
+            $err = $err.InnerException
+        }
+        return [pscustomobject]@{
+            Label = $Probe.Label
+            Code = 0
+            TotalSeconds = $Probe.Stopwatch.Elapsed.TotalSeconds
+            Error = $err.Message
+        }
+    }
+    finally {
+        $Probe.Request.Dispose()
+        $Probe.Client.Dispose()
+    }
+}
+
+function Write-OpenAiProbeResult {
+    param([pscustomobject]$Result)
+
+    Write-Log ("=== OpenAI {0} after enter changes ===" -f $Result.Label)
+    ("code={0} total={1:n3}s err={2}" -f $Result.Code, $Result.TotalSeconds, $Result.Error) |
+        Tee-Object -FilePath $LogPath -Append
+}
+
 function Test-EnterConnectivity {
-    Invoke-Logged "RAS status after enter changes" {
-        & rasdial.exe
+    param([switch]$AssumeLocalReady)
+
+    if ($AssumeLocalReady) {
+        Write-Log "Local state already validated by fast path."
     }
-    Invoke-Logged "Clash listen after enter changes" {
-        $proc = Get-Process -Name $Config.ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($proc) {
-            $proc | Select-Object Id, ProcessName, Path | Format-List
-            Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
-                Select-Object LocalAddress, LocalPort, State |
-                Sort-Object LocalPort |
-                Format-Table -AutoSize
+    else {
+        Invoke-Logged "local state after enter changes" {
+            "ras_connected={0}" -f (Test-RasConnected)
+            "proxy_listening={0}" -f (Test-ProxyPortListening)
+            "tun_ready={0}" -f (Test-TunInterfaceReady)
+            "nrpt_ready={0}" -f (Test-NrptRulesReady)
+            "split_routes_ready={0}" -f (Test-SplitRoutesReady)
         }
-        else {
-            "$($Config.ClashCoreProcessName) not found"
-        }
-    }
-    Invoke-Logged "targeted DNS after enter changes" {
-        foreach ($name in @("api.openai.com", "chatgpt.com", "github.com")) {
-            "--- default resolver: $name ---"
-            Resolve-DnsName -Name $name -Type A -DnsOnly -ErrorAction SilentlyContinue |
-                Select-Object Name, IPAddress, Type, Section |
-                Format-Table -AutoSize
-        }
-    }
-    Invoke-Logged "OpenAI direct after enter changes" {
-        & curl.exe -I -L --max-time 15 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
-    }
-    Invoke-Logged "OpenAI via Clash after enter changes" {
-        & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
-    }
-    Invoke-Logged "Codex TCP summary after enter changes" {
-        $ids = Get-Process |
-            Where-Object { $_.ProcessName -match "Codex|codex" } |
-            Select-Object -ExpandProperty Id
-        if ($ids) {
-            Get-NetTCPConnection -OwningProcess $ids -ErrorAction SilentlyContinue |
-                Group-Object State, RemoteAddress, RemotePort |
-                Sort-Object Count -Descending |
-                Select-Object Count, Name |
-                Format-Table -AutoSize
+
+        if (-not (Test-EnterReady)) {
+            throw "Local connectivity validation failed: ras=$(Test-RasConnected) proxy=$(Test-ProxyPortListening) tun=$(Test-TunInterfaceReady) nrpt=$(Test-NrptRulesReady) routes=$(Test-SplitRoutesReady)"
         }
     }
 
-    $direct = & curl.exe -I -L --max-time 15 --noproxy "*" -o NUL -s -w "%{http_code}" "https://api.openai.com/v1/models"
-    $proxy = & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "%{http_code}" "https://api.openai.com/v1/models"
+    if ($ProbeMode -eq "Minimal") {
+        Write-Log "ProbeMode=Minimal; skip OpenAI HTTP probes."
+        return
+    }
+
+    if ($ProbeMode -eq "Full") {
+        Invoke-Logged "RAS status after enter changes" {
+            & rasdial.exe
+        }
+        Invoke-Logged "Clash listen after enter changes" {
+            $proc = Get-Process -Name $Config.ClashCoreProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($proc) {
+                $proc | Select-Object Id, ProcessName, Path | Format-List
+                Get-NetTCPConnection -OwningProcess $proc.Id -State Listen -ErrorAction SilentlyContinue |
+                    Select-Object LocalAddress, LocalPort, State |
+                    Sort-Object LocalPort |
+                    Format-Table -AutoSize
+            }
+            else {
+                "$($Config.ClashCoreProcessName) not found"
+            }
+        }
+        Invoke-Logged "targeted DNS after enter changes" {
+            foreach ($name in @("api.openai.com", "chatgpt.com", "github.com")) {
+                "--- default resolver: $name ---"
+                Resolve-DnsName -Name $name -Type A -DnsOnly -ErrorAction SilentlyContinue |
+                    Select-Object Name, IPAddress, Type, Section |
+                    Format-Table -AutoSize
+            }
+        }
+        Invoke-Logged "Codex TCP summary after enter changes" {
+            $ids = Get-Process |
+                Where-Object { $_.ProcessName -match "Codex|codex" } |
+                Select-Object -ExpandProperty Id
+            if ($ids) {
+                Get-NetTCPConnection -OwningProcess $ids -ErrorAction SilentlyContinue |
+                    Group-Object State, RemoteAddress, RemotePort |
+                    Sort-Object Count -Descending |
+                    Select-Object Count, Name |
+                    Format-Table -AutoSize
+            }
+        }
+    }
+
+    if ($ProbeMode -eq "Balanced") {
+        $directProbe = Start-OpenAiHeadProbe -Label "direct"
+        $proxyProbe = Start-OpenAiHeadProbe -Label "via Clash" -UseProxy
+        $directResult = Complete-OpenAiHeadProbe -Probe $directProbe
+        $proxyResult = Complete-OpenAiHeadProbe -Probe $proxyProbe
+
+        Write-OpenAiProbeResult -Result $directResult
+        Write-OpenAiProbeResult -Result $proxyResult
+
+        if ($directResult.Code -ne 401 -or $proxyResult.Code -ne 401) {
+            throw "Connectivity validation failed: direct=$($directResult.Code) proxy=$($proxyResult.Code)"
+        }
+        return
+    }
+
+    Write-Log "=== OpenAI direct after enter changes ==="
+    $directResult = & curl.exe -I -L --connect-timeout 3 --max-time 8 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
+    if ([string]::IsNullOrWhiteSpace($directResult)) {
+        "(no output)" | Tee-Object -FilePath $LogPath -Append
+    }
+    else {
+        $directResult.TrimEnd() | Tee-Object -FilePath $LogPath -Append
+    }
+
+    Write-Log "=== OpenAI via Clash after enter changes ==="
+    $proxyResult = & curl.exe -I -L --connect-timeout 3 --max-time 8 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
+    if ([string]::IsNullOrWhiteSpace($proxyResult)) {
+        "(no output)" | Tee-Object -FilePath $LogPath -Append
+    }
+    else {
+        $proxyResult.TrimEnd() | Tee-Object -FilePath $LogPath -Append
+    }
+
+    $direct = if ($directResult -match "code=(\d{3})") { $Matches[1] } else { "000" }
+    $proxy = if ($proxyResult -match "code=(\d{3})") { $Matches[1] } else { "000" }
     if ($direct -ne "401" -or $proxy -ne "401") {
         throw "Connectivity validation failed: direct=$direct proxy=$proxy"
     }
@@ -520,13 +799,36 @@ try {
     Write-Log ("WatchdogPid={0}" -f $watchdog.Id)
     Write-Log ("WatchdogLogPath={0}" -f $WatchdogLogPath)
 
+    if (Test-EnterReady) {
+        Write-Log "FAST_PATH_ALREADY_READY: HITnet, Clash, TUN, NRPT, and split routes are already ready."
+        Test-EnterConnectivity -AssumeLocalReady
+        if (-not (Test-Path -LiteralPath $StatePath)) {
+            Capture-ExistingEnterState
+            Save-State
+        }
+        New-Item -Path $DonePath -ItemType File -Force | Out-Null
+        $Entered = $true
+        Write-Log ("ENTER_PPPOE_CODEX_OK. Restore with: {0} -RasEntry {1}" -f $RestoreScript, $RasEntry)
+        return
+    }
+
     PreRestore
     Initialize-ColdStartPrerequisites
-    $cred = Get-CredentialForRas
-    Connect-Ras -Cred $cred
+    if (-not (Test-RasConnected)) {
+        $cred = Get-CredentialForRas
+        Connect-Ras -Cred $cred
+    }
+    else {
+        Write-Log ("RAS entry {0} is already connected after pre-clean; skip credential prompt and dialing." -f $RasEntry)
+    }
     Add-EnterNrptRules
     Add-EnterSplitRoutes
-    Start-Sleep -Seconds 3
+    for ($i = 0; $i -lt 5; $i++) {
+        if ((Test-NrptRulesReady) -and (Test-SplitRoutesReady)) {
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
     Test-EnterConnectivity
     Save-State
     New-Item -Path $DonePath -ItemType File -Force | Out-Null

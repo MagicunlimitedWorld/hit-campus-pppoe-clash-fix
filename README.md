@@ -4,6 +4,8 @@
 
 主流程是：电脑开机后插好有线网，打开工具，一键启动/等待 Clash，并完成 PPPoE 拨号与代理修复。WLAN 只是回退路径，不是进入有线环境的前提。
 
+如果需要临时排查校园正版化/GP 激活，也可以使用“仅拨号有线 PPPoE”模式。该模式只执行 PPPoE 拨号，不启动 Clash、不修改 Clash、不添加 NRPT 或 split route。
+
 ## 适用环境
 
 - Windows
@@ -25,7 +27,13 @@ Start-HitNetClashFix.cmd
 1. 插好有线网，确认以太网适配器为已连接。
 2. 输入校园网账号和密码。
 3. 首次使用时检查 PPPoE 名称、代理地址、TUN 网卡名、Clash 路径。
-4. 点击“一键修复并连接有线 PPPoE”。
+4. 点击“修复 PPPoE + Clash”。
+
+仅拨号有线 PPPoE：
+
+1. 输入校园网账号和密码。
+2. 点击“仅拨号有线 PPPoE”。
+3. 工具只拨号，不处理 Clash。若 Clash TUN 已开启，系统流量仍可能经过 Clash，需要你在 Clash 中自行关闭 TUN 或系统代理。
 
 切换回 WLAN：
 
@@ -59,6 +67,7 @@ Start-HitNetClashFix.cmd
 - `HitNetClashConfig.ps1`：共享配置读取与自动探测逻辑。
 - `config.example.json`：公开模板配置。
 - `enter_pppoe_codex.ps1`：一键修复并连接有线 PPPoE + Clash。
+- `connect_pppoe_only.ps1`：仅 PPPoE 拨号，不启动或修改 Clash。
 - `auto_connect_pppoe_clash.ps1`：登录后自动连接入口。
 - `restore_wlan_clash.ps1`：恢复 WLAN + Clash。
 - `diagnostics/pppoe_clash_test_and_restore.ps1`：诊断和受控测试脚本。
@@ -78,6 +87,22 @@ Start-HitNetClashFix.cmd
 
 ```powershell
 .\enter_pppoe_codex.ps1
+```
+
+验证模式可选：
+
+```powershell
+.\enter_pppoe_codex.ps1 -ProbeMode Balanced
+.\enter_pppoe_codex.ps1 -ProbeMode Minimal
+.\enter_pppoe_codex.ps1 -ProbeMode Full
+```
+
+默认 `Balanced` 会保留关键本地检查和一次 OpenAI/Clash 探测；`Minimal` 不访问 OpenAI；`Full` 输出更完整诊断。
+
+仅拨号有线 PPPoE：
+
+```powershell
+.\connect_pppoe_only.ps1
 ```
 
 恢复 WLAN + Clash：
@@ -101,6 +126,8 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 - Clash 未启动：工具会按配置路径尝试启动 Clash Verge；若失败，请在 UI 中选择正确的 `clash-verge.exe`。
 - TUN 网卡未就绪：请先在 Clash Verge 中开启 TUN/Meta；本工具不会修改 Clash 配置。
 - TUN 已提前创建 split route：工具会复用现有路由，不会因此判定连接失败。
+- 已处于 PPPoE + Clash 修复状态：工具会走快速路径，不断开、不重拨。
+- 仅拨号模式仍经过 Clash：说明 Clash TUN 或系统代理已经在本机启用；该模式不会替你关闭或修改 Clash，请在 Clash 中手动关闭 TUN/系统代理后再试。
 - RAS `629`：通常是校园侧终止 PPPoE 认证/注册。等待 1-2 分钟后重试，若持续出现，请检查账号权限、在线会话限制、墙口/交换机端口、VLAN 或 PPPoE 服务状态。
 - 无法恢复：运行 `restore_wlan_clash.ps1`。脚本只清理本项目创建的临时 NRPT 和 split route。
 

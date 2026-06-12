@@ -71,9 +71,19 @@ function Test-ClashPortListening {
     param([string]$ProxyUrl)
     try {
         $uri = [Uri]$ProxyUrl
-        $listeners = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -in @($uri.Host, "127.0.0.1", "0.0.0.0", "::", "::1") }
-        return [bool]$listeners
+        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
+            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
+                return $false
+            }
+            $client.EndConnect($async)
+            return $true
+        }
+        finally {
+            $client.Close()
+        }
     }
     catch {
         return $false
@@ -150,7 +160,8 @@ try {
         -TunIpv6Gateway $Config.TunIpv6Gateway `
         -ClashPath $Config.ClashPath `
         -SettingsPath $SettingsPath `
-        -Credential $credential 2>&1 |
+        -Credential $credential `
+        -ProbeMode Balanced 2>&1 |
         ForEach-Object { Write-AutoLog $_.ToString() }
 
     Write-AutoLog "AUTO_CONNECT_DONE"

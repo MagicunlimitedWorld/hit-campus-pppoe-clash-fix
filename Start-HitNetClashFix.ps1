@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $EnterScript = Join-Path $ScriptDir "enter_pppoe_codex.ps1"
+$PppoeOnlyScript = Join-Path $ScriptDir "connect_pppoe_only.ps1"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
 $AutoConnectScript = Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
@@ -205,9 +206,19 @@ function Test-ClashPort {
     param([string]$Url)
     try {
         $uri = [Uri]$Url
-        $connections = Get-NetTCPConnection -LocalPort $uri.Port -State Listen -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -in @($uri.Host, "127.0.0.1", "0.0.0.0", "::", "::1") }
-        return [bool]$connections
+        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
+            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
+                return $false
+            }
+            $client.EndConnect($async)
+            return $true
+        }
+        finally {
+            $client.Close()
+        }
     }
     catch {
         return $false
@@ -594,18 +605,24 @@ $form.Controls.Add($refreshButton)
 
 $connectButton = [System.Windows.Forms.Button]::new()
 $connectButton.Location = [System.Drawing.Point]::new(128, 350)
-$connectButton.Size = [System.Drawing.Size]::new(260, 36)
-$connectButton.Text = "一键修复并连接有线 PPPoE"
+$connectButton.Size = [System.Drawing.Size]::new(220, 36)
+$connectButton.Text = "修复 PPPoE + Clash"
 $connectButton.BackColor = [System.Drawing.SystemColors]::Highlight
 $connectButton.ForeColor = [System.Drawing.Color]::White
 $connectButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
 $connectButton.UseVisualStyleBackColor = $false
 $form.Controls.Add($connectButton)
 
+$pppoeOnlyButton = [System.Windows.Forms.Button]::new()
+$pppoeOnlyButton.Location = [System.Drawing.Point]::new(362, 350)
+$pppoeOnlyButton.Size = [System.Drawing.Size]::new(180, 36)
+$pppoeOnlyButton.Text = "仅拨号有线 PPPoE"
+$form.Controls.Add($pppoeOnlyButton)
+
 $restoreButton = [System.Windows.Forms.Button]::new()
-$restoreButton.Location = [System.Drawing.Point]::new(408, 350)
-$restoreButton.Size = [System.Drawing.Size]::new(190, 36)
-$restoreButton.Text = "一键切换回 WLAN"
+$restoreButton.Location = [System.Drawing.Point]::new(556, 350)
+$restoreButton.Size = [System.Drawing.Size]::new(164, 36)
+$restoreButton.Text = "一键切回 WLAN"
 $form.Controls.Add($restoreButton)
 
 $outputBox = [System.Windows.Forms.TextBox]::new()
@@ -620,7 +637,7 @@ $form.Controls.Add($outputBox)
 $hintLabel = [System.Windows.Forms.Label]::new()
 $hintLabel.Location = [System.Drawing.Point]::new(20, 626)
 $hintLabel.Size = [System.Drawing.Size]::new(700, 32)
-$hintLabel.Text = "不要求先连接 WLAN；请插好有线并确保 Clash TUN 已开启。默认成功后窗口保持打开。"
+$hintLabel.Text = "主按钮修复 PPPoE + Clash；仅拨号模式不启动或修改 Clash，不添加 NRPT/split route。"
 $form.Controls.Add($hintLabel)
 
 $script:CurrentJob = $null
@@ -632,7 +649,7 @@ $script:SuppressAutoConnectChange = $false
 
 function Set-ControlsBusy {
     param([bool]$Busy)
-    foreach ($control in @($connectButton, $restoreButton, $refreshButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $autoConnectBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
+    foreach ($control in @($connectButton, $pppoeOnlyButton, $restoreButton, $refreshButton, $browseButton, $accountBox, $passwordBox, $rememberAccountBox, $rememberPasswordBox, $autoCloseBox, $autoConnectBox, $script:RasEntryBox, $script:ProxyUrlBox, $script:TunAliasBox, $script:ClashPathBox)) {
         $control.Enabled = -not $Busy
     }
 }
@@ -670,7 +687,7 @@ function Save-CurrentUiSettings {
 
 function Start-BackendJob {
     param(
-        [ValidateSet("connect", "restore")]
+        [ValidateSet("connect", "pppoeOnly", "restore")]
         [string]$Action,
         [pscredential]$Credential
     )
@@ -682,23 +699,49 @@ function Start-BackendJob {
     $script:CloseAfterSuccess = $false
     $script:SuccessSeenAt = $null
     $script:LastJobOutputText = ""
-    $statusLabel.Text = if ($Action -eq "connect") { "正在修复并连接有线 PPPoE..." } else { "正在切换回 WLAN..." }
+    $actionTitle = switch ($Action) {
+        "connect" { "修复 PPPoE + Clash" }
+        "pppoeOnly" { "仅拨号有线 PPPoE" }
+        "restore" { "切换回 WLAN" }
+    }
+    $scriptPath = switch ($Action) {
+        "connect" { $EnterScript }
+        "pppoeOnly" { $PppoeOnlyScript }
+        "restore" { $RestoreScript }
+    }
+    $statusLabel.Text = switch ($Action) {
+        "connect" { "正在修复 PPPoE + Clash..." }
+        "pppoeOnly" { "正在仅拨号连接有线 PPPoE..." }
+        "restore" { "正在切换回 WLAN..." }
+    }
     $outputBox.Clear()
-    Append-Output ("=== {0} {1} ===" -f ($(if ($Action -eq "connect") { "修复并连接有线 PPPoE" } else { "切换回 WLAN" }), (Get-Date -Format "yyyy-MM-dd HH:mm:ss")))
-    Append-Output ("脚本: {0}" -f $(if ($Action -eq "connect") { $EnterScript } else { $RestoreScript }))
+    Append-Output ("=== {0} {1} ===" -f $actionTitle, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+    Append-Output ("脚本: {0}" -f $scriptPath)
     Append-Output ("日志目录: {0}" -f $RuntimeLogDir)
-    Append-Output ("PPPoE={0} Proxy={1} TUN={2} ClashPath={3}" -f $cfg.RasEntry, $cfg.ProxyUrl, $cfg.TunInterfaceAlias, $cfg.ClashPath)
+    if ($Action -eq "pppoeOnly") {
+        Append-Output ("PPPoE={0}" -f $cfg.RasEntry)
+        Append-Output "仅拨号模式不会启动/关闭 Clash，不会添加或删除 NRPT、split route、DNS、MTU。"
+    }
+    else {
+        Append-Output ("PPPoE={0} Proxy={1} TUN={2} ClashPath={3}" -f $cfg.RasEntry, $cfg.ProxyUrl, $cfg.TunInterfaceAlias, $cfg.ClashPath)
+    }
 
     if ($Action -eq "connect") {
         $script:CurrentJob = Start-Job -ArgumentList $EnterScript, $cfg.RasEntry, $cfg.ProxyUrl, $cfg.TunInterfaceAlias, $cfg.TunIpv4Gateway, $cfg.TunIpv6Gateway, $cfg.ClashPath, $SettingsPath, $Credential -ScriptBlock {
             param($scriptPath, $ras, $proxy, $tun, $tunV4, $tunV6, $clash, $settings, $cred)
-            & $scriptPath -RasEntry $ras -ProxyUrl $proxy -TunInterfaceAlias $tun -TunIpv4Gateway $tunV4 -TunIpv6Gateway $tunV6 -ClashPath $clash -SettingsPath $settings -Credential $cred 2>&1 | ForEach-Object { $_.ToString() }
+            & $scriptPath -RasEntry $ras -ProxyUrl $proxy -TunInterfaceAlias $tun -TunIpv4Gateway $tunV4 -TunIpv6Gateway $tunV6 -ClashPath $clash -SettingsPath $settings -Credential $cred -ProbeMode Balanced 2>&1 | ForEach-Object { $_.ToString() }
+        }
+    }
+    elseif ($Action -eq "pppoeOnly") {
+        $script:CurrentJob = Start-Job -ArgumentList $PppoeOnlyScript, $cfg.RasEntry, $SettingsPath, $Credential -ScriptBlock {
+            param($scriptPath, $ras, $settings, $cred)
+            & $scriptPath -RasEntry $ras -SettingsPath $settings -Credential $cred 2>&1 | ForEach-Object { $_.ToString() }
         }
     }
     else {
         $script:CurrentJob = Start-Job -ArgumentList $RestoreScript, $cfg.RasEntry, $cfg.ProxyUrl, $cfg.TunInterfaceAlias, $cfg.TunIpv4Gateway, $cfg.TunIpv6Gateway, $SettingsPath -ScriptBlock {
             param($scriptPath, $ras, $proxy, $tun, $tunV4, $tunV6, $settings)
-            & $scriptPath -RasEntry $ras -ProxyUrl $proxy -TunInterfaceAlias $tun -TunIpv4Gateway $tunV4 -TunIpv6Gateway $tunV6 -SettingsPath $settings -Reason "ui restore" 2>&1 | ForEach-Object { $_.ToString() }
+            & $scriptPath -RasEntry $ras -ProxyUrl $proxy -TunInterfaceAlias $tun -TunIpv4Gateway $tunV4 -TunIpv6Gateway $tunV6 -SettingsPath $settings -ProbeMode Balanced -Reason "ui restore" 2>&1 | ForEach-Object { $_.ToString() }
         }
     }
 }
@@ -787,6 +830,35 @@ $connectButton.Add_Click({
     Start-BackendJob -Action "connect" -Credential $credential
 })
 
+$pppoeOnlyButton.Add_Click({
+    if ([string]::IsNullOrWhiteSpace($accountBox.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("请输入校园网账号。", "缺少账号", "OK", "Warning") | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($passwordBox.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("请输入校园网密码。", "缺少密码", "OK", "Warning") | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($script:RasEntryBox.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("请填写 PPPoE 名称。", "缺少配置", "OK", "Warning") | Out-Null
+        return
+    }
+
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "仅拨号模式不会启动、关闭或配置 Clash，也不会添加或删除 NRPT/split route。若 Clash TUN 已开启，系统流量仍可能经过 Clash。是否继续只拨号？",
+        "仅拨号有线 PPPoE",
+        "OKCancel",
+        "Information"
+    )
+    if ($confirm -ne "OK") {
+        return
+    }
+
+    $securePassword = ConvertTo-SecureString $passwordBox.Text -AsPlainText -Force
+    $credential = [pscredential]::new($accountBox.Text.Trim(), $securePassword)
+    Start-BackendJob -Action "pppoeOnly" -Credential $credential
+})
+
 $restoreButton.Add_Click({
     Start-BackendJob -Action "restore"
 })
@@ -812,12 +884,20 @@ $timer.Add_Tick({
             Remove-Job -Job $script:CurrentJob -Force -ErrorAction SilentlyContinue
             $script:CurrentJob = $null
 
-            $successToken = if ($script:CurrentAction -eq "connect") { "ENTER_PPPOE_CODEX_OK" } else { "RESTORE_WLAN_CLASH_DONE" }
+            $successToken = switch ($script:CurrentAction) {
+                "connect" { "ENTER_PPPOE_CODEX_OK" }
+                "pppoeOnly" { "PPPOE_ONLY_OK" }
+                "restore" { "RESTORE_WLAN_CLASH_DONE" }
+            }
             $success = ($state -eq "Completed" -and $output -match [regex]::Escape($successToken))
             if ($success) {
                 Append-Output (Get-DetailedStatusText -Label "操作完成后状态")
                 if ($autoCloseBox.Checked) {
-                    $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "连接成功，窗口即将关闭。" } else { "已切换回 WLAN，窗口即将关闭。" }
+                    $statusLabel.Text = switch ($script:CurrentAction) {
+                        "connect" { "连接成功，窗口即将关闭。" }
+                        "pppoeOnly" { "仅 PPPoE 拨号成功，窗口即将关闭。" }
+                        "restore" { "已切换回 WLAN，窗口即将关闭。" }
+                    }
                     $script:CloseAfterSuccess = $true
                     $script:SuccessSeenAt = Get-Date
                 }
@@ -834,7 +914,11 @@ $timer.Add_Tick({
             }
         }
         else {
-            $statusLabel.Text = if ($script:CurrentAction -eq "connect") { "正在修复并连接有线 PPPoE..." } else { "正在切换回 WLAN..." }
+            $statusLabel.Text = switch ($script:CurrentAction) {
+                "connect" { "正在修复 PPPoE + Clash..." }
+                "pppoeOnly" { "正在仅拨号连接有线 PPPoE..." }
+                "restore" { "正在切换回 WLAN..." }
+            }
         }
     }
     elseif ($script:CloseAfterSuccess -and $null -ne $script:SuccessSeenAt) {
