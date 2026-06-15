@@ -160,6 +160,17 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 - 不修改 DNS、MTU 或系统代理的永久配置。
 - 不上传日志、运行状态、Clash 配置备份、`.runtime/` 或 `.local/` 本地凭据。
 
+## 项目维护
+
+- `HitNetClashRuntime.ps1`：共享运行时 helper，集中日志、RAS、端口、TUN、NRPT、split route、OpenAI probe 和 mutex 工具函数。
+- `Test-HitNetClashProject.ps1`：发布前自检入口，默认执行 PowerShell parser、UI SelfTest、auto-connect ValidateOnly、`config.example.json` 解析、`git diff --check` 和敏感信息扫描。
+- 默认自检不执行会切换网络状态的 restore 或 enter 冷启动流程；需要验证 enter 单实例锁时可加 `-IncludeBusyLockCheck`。
+
+```powershell
+.\Test-HitNetClashProject.ps1
+.\Test-HitNetClashProject.ps1 -IncludeBusyLockCheck
+```
+
 ## License
 
 MIT

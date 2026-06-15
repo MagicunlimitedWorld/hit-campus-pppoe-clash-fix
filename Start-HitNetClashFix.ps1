@@ -16,6 +16,7 @@ $PppoeOnlyScript = Join-Path $ScriptDir "connect_pppoe_only.ps1"
 $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
 $AutoConnectScript = Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
 $AutoConnectTaskName = "HitCampusPppoeClashAutoConnect"
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
@@ -29,7 +30,11 @@ if ([string]::IsNullOrWhiteSpace($SettingsPath)) {
 if (-not (Test-Path -LiteralPath $ConfigScript)) {
     throw "Config helper not found: $ConfigScript"
 }
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
+}
 . $ConfigScript
+. $RuntimeScript
 $script:CurrentConfig = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -ClashPath $ClashPath
 
 $script:RasEntryBox = $null
@@ -211,67 +216,21 @@ function Get-UiConfig {
 
 function Test-ClashPort {
     param([string]$Url)
-    try {
-        $uri = [Uri]$Url
-        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
-        $client = [System.Net.Sockets.TcpClient]::new()
-        try {
-            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
-            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
-                return $false
-            }
-            $client.EndConnect($async)
-            return $true
-        }
-        finally {
-            $client.Close()
-        }
-    }
-    catch {
-        return $false
-    }
+    return (Test-HitNetProxyPortListening -ProxyUrl $Url)
 }
 
 function Get-RasConnected {
     param([string]$EntryName)
-    try {
-        $status = (& rasdial.exe 2>&1 | Out-String)
-        return ($status -match [regex]::Escape($EntryName))
-    }
-    catch {
-        return $false
-    }
+    return (Test-HitNetRasConnected -EntryName $EntryName)
 }
 
 function Get-TunReady {
     param([string]$Alias)
-    try {
-        $adapter = Get-NetAdapter -Name $Alias -ErrorAction SilentlyContinue
-        return ($adapter -and $adapter.Status -eq "Up")
-    }
-    catch {
-        return $false
-    }
+    return (Test-HitNetTunReady -TunInterfaceAlias $Alias)
 }
 
 function Get-EthernetReady {
-    foreach ($pattern in @($script:CurrentConfig.EthernetNamePatterns)) {
-        if ([string]::IsNullOrWhiteSpace($pattern)) {
-            continue
-        }
-        $namePattern = "*$($pattern.Trim())*"
-        $adapter = Get-NetAdapter -Name $namePattern -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Status -eq "Up" -and
-                $_.Name -ne $script:CurrentConfig.TunInterfaceAlias -and
-                $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth"
-            } |
-            Select-Object -First 1
-        if ($adapter) {
-            return $true
-        }
-    }
-    return $false
+    return (Test-HitNetEthernetReady -EthernetNamePatterns @($script:CurrentConfig.EthernetNamePatterns) -TunInterfaceAlias $script:CurrentConfig.TunInterfaceAlias)
 }
 
 function Get-AutoConnectTask {
@@ -289,18 +248,7 @@ function Get-AutoConnectTaskActionArguments {
 }
 
 function Get-AutoConnectTaskStatusText {
-    $task = Get-AutoConnectTask
-    if (-not $task) {
-        return "登录后自动连接: 未启用"
-    }
-
-    try {
-        $info = Get-ScheduledTaskInfo -TaskName $AutoConnectTaskName -ErrorAction Stop
-        return "登录后自动连接: 已启用 State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
-    }
-    catch {
-        return "登录后自动连接: 已启用 State=$($task.State)"
-    }
+    return (Get-HitNetScheduledTaskSnapshot -TaskName $AutoConnectTaskName).Text
 }
 
 function Register-AutoConnectTask {
@@ -795,81 +743,28 @@ function Start-StatusRefreshJob {
 
     $jobConfig = Get-StatusJobConfig
     $script:StatusJobMode = $Mode
-    $script:StatusJob = Start-Job -ArgumentList $Mode, $Label, $jobConfig, $StatePath, $AutoConnectTaskName, $MaskedAccount -ScriptBlock {
-        param($Mode, $Label, $Config, $StatePathValue, $TaskName, $MaskedAccountValue)
+    $script:StatusJob = Start-Job -ArgumentList $Mode, $Label, $jobConfig, $StatePath, $AutoConnectTaskName, $MaskedAccount, $RuntimeScript -ScriptBlock {
+        param($Mode, $Label, $Config, $StatePathValue, $TaskName, $MaskedAccountValue, $RuntimeScriptPath)
 
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        if (-not (Test-Path -LiteralPath $RuntimeScriptPath)) {
+            throw "Runtime helper not found: $RuntimeScriptPath"
+        }
+        . $RuntimeScriptPath
 
         function Test-LocalProxyPort {
             param([string]$Url)
-            try {
-                $uri = [Uri]$Url
-                $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
-                $client = [System.Net.Sockets.TcpClient]::new()
-                try {
-                    $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
-                    if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
-                        return $false
-                    }
-                    $client.EndConnect($async)
-                    return $true
-                }
-                finally {
-                    $client.Close()
-                }
-            }
-            catch {
-                return $false
-            }
+            return (Test-HitNetProxyPortListening -ProxyUrl $Url)
         }
 
         function Test-TargetEthernetReady {
             param($Config)
-            foreach ($pattern in @($Config.EthernetNamePatterns)) {
-                if ([string]::IsNullOrWhiteSpace([string]$pattern)) {
-                    continue
-                }
-                $namePattern = "*$(([string]$pattern).Trim())*"
-                $adapter = Get-NetAdapter -Name $namePattern -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        $_.Status -eq "Up" -and
-                        $_.Name -ne $Config.TunInterfaceAlias -and
-                        $_.Name -notmatch "WLAN|Wi-?Fi|Wireless|Meta|Clash|TUN|Loopback|Bluetooth"
-                    } |
-                    Select-Object -First 1
-                if ($adapter) {
-                    return $true
-                }
-            }
-            return $false
+            return (Test-HitNetEthernetReady -EthernetNamePatterns @($Config.EthernetNamePatterns) -TunInterfaceAlias $Config.TunInterfaceAlias)
         }
 
         function Get-TaskSnapshot {
             param([string]$TaskName)
-            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $task) {
-                return [pscustomobject]@{
-                    Enabled = $false
-                    Text = "登录后自动连接: 未启用"
-                    ActionText = "(not registered)"
-                }
-            }
-            $text = "登录后自动连接: 已启用 State=$($task.State)"
-            try {
-                $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
-                $text = "登录后自动连接: 已启用 State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
-            }
-            catch {
-            }
-            $actions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
-            if ([string]::IsNullOrWhiteSpace($actions)) {
-                $actions = "(registered without action text)"
-            }
-            return [pscustomobject]@{
-                Enabled = $true
-                Text = $text
-                ActionText = $actions
-            }
+            return (Get-HitNetScheduledTaskSnapshot -TaskName $TaskName)
         }
 
         function New-StatusResult {
@@ -940,12 +835,7 @@ function Start-StatusRefreshJob {
             $nrptRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
                 Where-Object { $_.Comment -like "CodexClash*" -or $_.DisplayName -like "CodexClash*" })
             $splitRoutes = @(Get-NetRoute -DestinationPrefix $prefixes -ErrorAction SilentlyContinue)
-            $expectedRoutes = @(
-                [pscustomobject]@{ Prefix = "0.0.0.0/1"; NextHop = $Config.TunIpv4Gateway },
-                [pscustomobject]@{ Prefix = "128.0.0.0/1"; NextHop = $Config.TunIpv4Gateway },
-                [pscustomobject]@{ Prefix = "::/1"; NextHop = $Config.TunIpv6Gateway },
-                [pscustomobject]@{ Prefix = "8000::/1"; NextHop = $Config.TunIpv6Gateway }
-            )
+            $expectedRoutes = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
             $splitRoutesReady = $true
             foreach ($route in $expectedRoutes) {
                 $found = $splitRoutes |

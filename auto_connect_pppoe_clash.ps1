@@ -7,14 +7,19 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
 $EnterScript = Join-Path $ScriptDir "enter_pppoe_codex.ps1"
 if (-not (Test-Path -LiteralPath $ConfigScript)) {
     throw "Config helper not found: $ConfigScript"
+}
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
 }
 if (-not (Test-Path -LiteralPath $EnterScript)) {
     throw "Enter script not found: $EnterScript"
 }
 . $ConfigScript
+. $RuntimeScript
 
 if ([string]::IsNullOrWhiteSpace($SettingsPath)) {
     $SettingsPath = Join-Path $ScriptDir ".local\settings.json"
@@ -31,8 +36,7 @@ $LogPath = Join-Path $RuntimeLogDir ("auto_connect_{0}.log" -f $Timestamp)
 
 function Write-AutoLog {
     param([string]$Message = "")
-    $line = "{0} {1}" -f (Get-Date -Format "s"), $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Write-HitNetLog -LogPath $LogPath -Message $Message
 }
 
 function Get-SavedCredential {
@@ -63,38 +67,16 @@ function Get-SavedCredential {
 
 function Test-RasConnected {
     param([string]$EntryName)
-    $status = (& rasdial.exe 2>&1 | Out-String)
-    return ($status -match [regex]::Escape($EntryName))
+    return (Test-HitNetRasConnected -EntryName $EntryName)
 }
 
 function Test-ClashPortListening {
     param([string]$ProxyUrl)
-    try {
-        $uri = [Uri]$ProxyUrl
-        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
-        $client = [System.Net.Sockets.TcpClient]::new()
-        try {
-            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
-            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
-                return $false
-            }
-            $client.EndConnect($async)
-            return $true
-        }
-        finally {
-            $client.Close()
-        }
-    }
-    catch {
-        return $false
-    }
+    return (Test-HitNetProxyPortListening -ProxyUrl $ProxyUrl)
 }
 
 function Test-CodexNrptReady {
-    $rules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { $_.Comment -like "CodexClash*" -or $_.DisplayName -like "CodexClash*" })
-    $namespaces = @($rules | ForEach-Object { $_.Namespace })
-    return (($namespaces -contains ".openai.com") -and ($namespaces -contains ".github.com"))
+    return (Test-HitNetNrptRulesReady -NrptNamespaces @($Config.NrptNamespaces))
 }
 
 function Test-SplitRoutesReady {
@@ -104,29 +86,16 @@ function Test-SplitRoutesReady {
         [string]$TunIpv6Gateway
     )
 
-    $expected = @(
-        [pscustomobject]@{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        [pscustomobject]@{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        [pscustomobject]@{ Prefix = "::/1"; NextHop = $TunIpv6Gateway },
-        [pscustomobject]@{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway }
-    )
-    foreach ($route in $expected) {
-        $found = Get-NetRoute -DestinationPrefix $route.Prefix -InterfaceAlias $TunInterfaceAlias -NextHop $route.NextHop -ErrorAction SilentlyContinue
-        if (-not $found) {
-            return $false
-        }
-    }
-    return $true
+    return (Test-HitNetSplitRoutesReady -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
 }
 
 function Test-AlreadyConnected {
     param($Config)
 
-    $tun = Get-NetAdapter -Name $Config.TunInterfaceAlias -ErrorAction SilentlyContinue
     return (
         (Test-RasConnected -EntryName $Config.RasEntry) -and
         (Test-ClashPortListening -ProxyUrl $Config.ProxyUrl) -and
-        ($tun -and $tun.Status -eq "Up") -and
+        (Test-HitNetTunReady -TunInterfaceAlias $Config.TunInterfaceAlias) -and
         (Test-CodexNrptReady) -and
         (Test-SplitRoutesReady -TunInterfaceAlias $Config.TunInterfaceAlias -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
     )

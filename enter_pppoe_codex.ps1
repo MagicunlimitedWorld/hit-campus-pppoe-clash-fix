@@ -21,10 +21,15 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
 if (-not (Test-Path -LiteralPath $ConfigScript)) {
     throw "Config helper not found: $ConfigScript"
 }
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
+}
 . $ConfigScript
+. $RuntimeScript
 $Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -ClashPath $ClashPath
 $RasEntry = $Config.RasEntry
 $ProxyUrl = $Config.ProxyUrl
@@ -54,13 +59,11 @@ $CreatedNrptRuleNames = New-Object System.Collections.Generic.List[string]
 $AddedRoutes = New-Object System.Collections.Generic.List[object]
 $Entered = $false
 $EnterMutexName = "Local\HitCampusPppoeClashEnter"
-$EnterMutex = $null
-$EnterMutexAcquired = $false
+$EnterMutexState = New-HitNetNamedMutexState -Name $EnterMutexName
 
 function Write-Log {
     param([string]$Message = "")
-    $line = "{0} {1}" -f (Get-Date -Format "s"), $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Write-HitNetLog -LogPath $LogPath -Message $Message
 }
 
 function Invoke-Logged {
@@ -68,80 +71,28 @@ function Invoke-Logged {
         [string]$Title,
         [scriptblock]$Script
     )
-    Write-Log ("=== {0} ===" -f $Title)
-    $output = & $Script 2>&1 | Out-String -Width 4096
-    if ([string]::IsNullOrWhiteSpace($output)) {
-        "(no output)" | Tee-Object -FilePath $LogPath -Append
-    }
-    else {
-        $output.TrimEnd() | Tee-Object -FilePath $LogPath -Append
-    }
+    Invoke-HitNetLogged -LogPath $LogPath -Title $Title -Script $Script
 }
 
 function Acquire-EnterLock {
-    $script:EnterMutex = [System.Threading.Mutex]::new($false, $EnterMutexName)
-    $timeoutSeconds = [Math]::Max(0, $LockWaitSeconds)
-
-    try {
-        if ($timeoutSeconds -eq 0) {
-            $script:EnterMutexAcquired = $script:EnterMutex.WaitOne(0)
-        }
-        else {
-            $script:EnterMutexAcquired = $script:EnterMutex.WaitOne([TimeSpan]::FromSeconds($timeoutSeconds))
-        }
-    }
-    catch [System.Threading.AbandonedMutexException] {
-        $script:EnterMutexAcquired = $true
-    }
-
-    if (-not $script:EnterMutexAcquired) {
-        $script:EnterMutex.Dispose()
-        $script:EnterMutex = $null
-        return $false
-    }
-
-    Write-Log ("Enter lock acquired: {0}" -f $EnterMutexName)
-    return $true
+    return (Acquire-HitNetNamedMutex -State $script:EnterMutexState -WaitSeconds $LockWaitSeconds -LogPath $LogPath)
 }
 
 function Release-EnterLock {
-    if ($script:EnterMutex) {
-        try {
-            if ($script:EnterMutexAcquired) {
-                $script:EnterMutex.ReleaseMutex()
-                Write-Log ("Enter lock released: {0}" -f $EnterMutexName)
-            }
-        }
-        catch {
-            Write-Log ("Enter lock release warning: {0}" -f $_.Exception.Message)
-        }
-        finally {
-            $script:EnterMutex.Dispose()
-            $script:EnterMutex = $null
-            $script:EnterMutexAcquired = $false
-        }
-    }
+    Release-HitNetNamedMutex -State $script:EnterMutexState -LogPath $LogPath
 }
 
 function Assert-WorkspacePath {
     param([string]$Path)
-    $workspace = (Resolve-Path -LiteralPath $ScriptDir).Path
-    $full = [System.IO.Path]::GetFullPath($Path)
-    if (-not $full.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Path escapes workspace: $full"
+    if (-not (Test-HitNetWorkspacePath -WorkspacePath $ScriptDir -Path $Path)) {
+        throw "Path escapes workspace: $([System.IO.Path]::GetFullPath($Path))"
     }
 }
 
 function Get-PlainPasswordFromCredential {
     param([pscredential]$Cred)
 
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Cred.Password)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
+    return (Get-HitNetPlainPasswordFromCredential -Credential $Cred)
 }
 
 function Read-NonEmptyValue {
@@ -233,36 +184,11 @@ function PreRestore {
     }
 
     Invoke-Logged "pre-clean stale Codex NRPT rules without disconnecting RAS" {
-        $rules = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Comment -like "CodexClashEnter*" -or
-                $_.DisplayName -like "CodexClashEnter*" -or
-                $_.Comment -like "CodexClashTrial*" -or
-                $_.DisplayName -like "CodexClashTrial*"
-            }
-
-        foreach ($rule in $rules) {
-            "Removing NRPT rule: Name=$($rule.Name) Namespace=$($rule.Namespace -join ',')"
-            Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction SilentlyContinue
-        }
+        Remove-HitNetProjectNrptRules
     }
 
     Invoke-Logged "pre-clean stale Codex split routes without disconnecting RAS" {
-        foreach ($prefix in @("0.0.0.0/1", "128.0.0.0/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv4Gateway -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    "Removing IPv4 split route: $($_.DestinationPrefix) via $($_.NextHop)"
-                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                }
-        }
-
-        foreach ($prefix in @("::/1", "8000::/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv6Gateway -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    "Removing IPv6 split route: $($_.DestinationPrefix) via $($_.NextHop)"
-                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                }
-        }
+        Remove-HitNetSplitRoutes -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
     }
 
     Invoke-Logged "pre-clean active state file" {
@@ -277,71 +203,23 @@ function PreRestore {
 }
 
 function Test-ProxyPortListening {
-    try {
-        $uri = [Uri]$ProxyUrl
-        $hostName = if ($uri.Host -in @("0.0.0.0", "::", "[::]")) { "127.0.0.1" } else { $uri.Host }
-        $client = [System.Net.Sockets.TcpClient]::new()
-        try {
-            $async = $client.BeginConnect($hostName, $uri.Port, $null, $null)
-            if (-not $async.AsyncWaitHandle.WaitOne(800, $false)) {
-                return $false
-            }
-            $client.EndConnect($async)
-            return $true
-        }
-        finally {
-            $client.Close()
-        }
-    }
-    catch {
-        return $false
-    }
+    return (Test-HitNetProxyPortListening -ProxyUrl $ProxyUrl)
 }
 
 function Test-RasConnected {
-    $status = (& rasdial.exe 2>&1 | Out-String)
-    return ($status -match [regex]::Escape($RasEntry))
+    return (Test-HitNetRasConnected -EntryName $RasEntry)
 }
 
 function Test-TunInterfaceReady {
-    $adapter = Get-NetAdapter -Name $TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
-    return ($adapter -and $adapter.Status -eq "Up")
+    return (Test-HitNetTunReady -TunInterfaceAlias $TunInterfaceAlias)
 }
 
 function Test-NrptRulesReady {
-    $rules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object { @($_.NameServers) -contains "198.18.0.2" })
-
-    foreach ($namespace in $NrptNamespaces) {
-        $rule = $rules |
-            Where-Object { @($_.Namespace) -contains $namespace } |
-            Select-Object -First 1
-        if (-not $rule) {
-            return $false
-        }
-    }
-    return $true
+    return (Test-HitNetNrptRulesReady -NrptNamespaces $NrptNamespaces)
 }
 
 function Test-SplitRoutesReady {
-    $routes = @(
-        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway },
-        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway }
-    )
-    $routeTable = @(Get-NetRoute -DestinationPrefix ($routes.Prefix) -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
-
-    foreach ($route in $routes) {
-        $found = $routeTable |
-            Where-Object { $_.DestinationPrefix -eq $route.Prefix -and $_.NextHop -eq $route.NextHop } |
-            Select-Object -First 1
-        if (-not $found) {
-            return $false
-        }
-    }
-    return $true
+    return (Test-HitNetSplitRoutesReady -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
 }
 
 function Test-EnterReady {
@@ -525,19 +403,7 @@ function Connect-Ras {
 function Get-RasFailureHint {
     param([string]$RasOutput)
 
-    if ($RasOutput -match "(?i)(error|错误)\s*629| 629 ") {
-        return "RAS_ERROR_629: remote side terminated PPPoE during authentication/registration. Common causes: wrong password, campus account/session restriction, PPPoE server/port/VLAN rejecting the session, or retrying too soon after a previous session."
-    }
-    if ($RasOutput -match "(?i)(error|错误)\s*691| 691 ") {
-        return "RAS_ERROR_691: authentication failed. Re-enter the campus account password carefully."
-    }
-    if ($RasOutput -match "(?i)(error|错误)\s*651| 651 ") {
-        return "RAS_ERROR_651: PPPoE server or physical link did not respond. Check Ethernet link, wall port, VLAN, and campus PPPoE availability."
-    }
-    if ($RasOutput -match "(?i)(error|错误)\s*633| 633 ") {
-        return "RAS_ERROR_633: modem/PPPoE device is already in use. Disconnect stale PPPoE sessions and retry."
-    }
-    return "RAS_ERROR_UNKNOWN: PPPoE did not connect; inspect the preceding rasdial output."
+    return (Get-HitNetRasFailureHint -RasOutput $RasOutput)
 }
 
 function Add-EnterNrptRules {
@@ -653,80 +519,19 @@ function Start-OpenAiHeadProbe {
         [switch]$UseProxy
     )
 
-    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
-
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.AllowAutoRedirect = $true
-    if ($UseProxy) {
-        $handler.UseProxy = $true
-        $handler.Proxy = [System.Net.WebProxy]::new($ProxyUrl)
-    }
-    else {
-        $handler.UseProxy = $false
-    }
-
-    $client = [System.Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(8)
-    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, "https://api.openai.com/v1/models")
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $task = $client.SendAsync($request)
-
-    return [pscustomobject]@{
-        Label = $Label
-        Client = $client
-        Request = $request
-        Task = $task
-        Stopwatch = $watch
-    }
+    return (Start-HitNetOpenAiHeadProbe -Label $Label -ProxyUrl $ProxyUrl -UseProxy:$UseProxy)
 }
 
 function Complete-OpenAiHeadProbe {
     param([pscustomobject]$Probe)
 
-    try {
-        if (-not $Probe.Task.Wait(8000)) {
-            throw "timeout"
-        }
-
-        $Probe.Stopwatch.Stop()
-        $response = $Probe.Task.Result
-        try {
-            return [pscustomobject]@{
-                Label = $Probe.Label
-                Code = [int]$response.StatusCode
-                TotalSeconds = $Probe.Stopwatch.Elapsed.TotalSeconds
-                Error = ""
-            }
-        }
-        finally {
-            $response.Dispose()
-        }
-    }
-    catch {
-        $Probe.Stopwatch.Stop()
-        $err = $_.Exception
-        if ($err.InnerException) {
-            $err = $err.InnerException
-        }
-        return [pscustomobject]@{
-            Label = $Probe.Label
-            Code = 0
-            TotalSeconds = $Probe.Stopwatch.Elapsed.TotalSeconds
-            Error = $err.Message
-        }
-    }
-    finally {
-        $Probe.Request.Dispose()
-        $Probe.Client.Dispose()
-    }
+    return (Complete-HitNetOpenAiHeadProbe -Probe $Probe)
 }
 
 function Write-OpenAiProbeResult {
     param([pscustomobject]$Result)
 
-    Write-Log ("=== OpenAI {0} after enter changes ===" -f $Result.Label)
-    ("code={0} total={1:n3}s err={2}" -f $Result.Code, $Result.TotalSeconds, $Result.Error) |
-        Tee-Object -FilePath $LogPath -Append
+    Write-HitNetOpenAiProbeResult -LogPath $LogPath -Result $Result
 }
 
 function Test-EnterConnectivity {

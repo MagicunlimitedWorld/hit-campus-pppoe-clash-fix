@@ -11,10 +11,15 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
 if (-not (Test-Path -LiteralPath $ConfigScript)) {
     throw "Config helper not found: $ConfigScript"
 }
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
+}
 . $ConfigScript
+. $RuntimeScript
 
 $Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry
 $RasEntry = $Config.RasEntry
@@ -34,8 +39,7 @@ $DonePath = Join-Path $RuntimeMarkerDir ("connect_pppoe_only_{0}.done" -f $Times
 
 function Write-Log {
     param([string]$Message = "")
-    $line = "{0} {1}" -f (Get-Date -Format "s"), $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Write-HitNetLog -LogPath $LogPath -Message $Message
 }
 
 function Invoke-Logged {
@@ -44,26 +48,13 @@ function Invoke-Logged {
         [scriptblock]$Script
     )
 
-    Write-Log ("=== {0} ===" -f $Title)
-    $output = & $Script 2>&1 | Out-String -Width 4096
-    if ([string]::IsNullOrWhiteSpace($output)) {
-        "(no output)" | Tee-Object -FilePath $LogPath -Append
-    }
-    else {
-        $output.TrimEnd() | Tee-Object -FilePath $LogPath -Append
-    }
+    Invoke-HitNetLogged -LogPath $LogPath -Title $Title -Script $Script
 }
 
 function Get-PlainPasswordFromCredential {
     param([pscredential]$Cred)
 
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Cred.Password)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
+    return (Get-HitNetPlainPasswordFromCredential -Credential $Cred)
 }
 
 function Read-NonEmptyValue {
@@ -115,12 +106,12 @@ function Get-RasCredential {
 function Test-RasConnected {
     param([string]$EntryName)
 
-    $status = (& rasdial.exe 2>&1 | Out-String)
-    return ($status -match [regex]::Escape($EntryName))
+    return (Test-HitNetRasConnected -EntryName $EntryName)
 }
 
 function Get-ExistingClashRouteSummary {
-    $routes = Get-NetRoute -DestinationPrefix "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
+    $expected = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
+    $routes = Get-NetRoute -DestinationPrefix ($expected.Prefix) -ErrorAction SilentlyContinue |
         Where-Object {
             $_.InterfaceAlias -eq $Config.TunInterfaceAlias -or
             $_.NextHop -in @($Config.TunIpv4Gateway, $Config.TunIpv6Gateway)

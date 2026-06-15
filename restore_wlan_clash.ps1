@@ -17,6 +17,7 @@ $ErrorActionPreference = "Continue"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
 if (Test-Path -LiteralPath $ConfigScript) {
     . $ConfigScript
     $Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
@@ -35,6 +36,10 @@ else {
     if ([string]::IsNullOrWhiteSpace($TunIpv6Gateway)) { $TunIpv6Gateway = "fdfe:dcba:9876::2" }
     $ClashCoreProcessName = "verge-mihomo"
 }
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
+}
+. $RuntimeScript
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
@@ -50,8 +55,7 @@ $LegacyStatePath = Join-Path $ScriptDir "pppoe_codex_active_state.json"
 
 function Write-Log {
     param([string]$Message = "")
-    $line = "{0} {1}" -f (Get-Date -Format "s"), $Message
-    $line | Tee-Object -FilePath $LogPath -Append
+    Write-HitNetLog -LogPath $LogPath -Message $Message
 }
 
 function Invoke-Logged {
@@ -59,55 +63,18 @@ function Invoke-Logged {
         [string]$Title,
         [scriptblock]$Script
     )
-    Write-Log ("=== {0} ===" -f $Title)
-    try {
-        $output = & $Script 2>&1 | Out-String -Width 4096
-        if ([string]::IsNullOrWhiteSpace($output)) {
-            "(no output)" | Tee-Object -FilePath $LogPath -Append
-        }
-        else {
-            $output.TrimEnd() | Tee-Object -FilePath $LogPath -Append
-        }
-    }
-    catch {
-        Write-Log ("ERROR: {0}" -f $_.Exception.Message)
-    }
+    Invoke-HitNetLogged -LogPath $LogPath -Title $Title -Script $Script -ContinueOnError
 }
 
 function Remove-CodexNrptRules {
     Invoke-Logged "remove CodexClash NRPT rules" {
-        $rules = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Comment -like "CodexClashEnter*" -or
-                $_.DisplayName -like "CodexClashEnter*" -or
-                $_.Comment -like "CodexClashTrial*" -or
-                $_.DisplayName -like "CodexClashTrial*"
-            }
-
-        foreach ($rule in $rules) {
-            "Removing NRPT rule: Name=$($rule.Name) Namespace=$($rule.Namespace -join ',')"
-            Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction SilentlyContinue
-        }
+        Remove-HitNetProjectNrptRules
     }
 }
 
 function Remove-CodexSplitRoutes {
     Invoke-Logged "remove CodexClash split routes" {
-        foreach ($prefix in @("0.0.0.0/1", "128.0.0.0/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv4Gateway -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    "Removing IPv4 split route: $($_.DestinationPrefix) via $($_.NextHop)"
-                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                }
-        }
-
-        foreach ($prefix in @("::/1", "8000::/1")) {
-            Get-NetRoute -DestinationPrefix $prefix -InterfaceAlias $TunInterfaceAlias -NextHop $TunIpv6Gateway -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    "Removing IPv6 split route: $($_.DestinationPrefix) via $($_.NextHop)"
-                    $_ | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-                }
-        }
+        Remove-HitNetSplitRoutes -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
     }
 }
 
@@ -139,40 +106,15 @@ function Remove-StateFile {
 }
 
 function Test-CodexNrptRemoved {
-    $rules = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Comment -like "CodexClashEnter*" -or
-            $_.DisplayName -like "CodexClashEnter*" -or
-            $_.Comment -like "CodexClashTrial*" -or
-            $_.DisplayName -like "CodexClashTrial*"
-        }
-    return (-not $rules)
+    return (Test-HitNetProjectNrptRemoved)
 }
 
 function Test-CodexSplitRoutesRemoved {
-    $routes = @(
-        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway },
-        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway },
-        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway }
-    )
-    $routeTable = @(Get-NetRoute -DestinationPrefix ($routes.Prefix) -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
-
-    foreach ($route in $routes) {
-        $found = $routeTable |
-            Where-Object { $_.DestinationPrefix -eq $route.Prefix -and $_.NextHop -eq $route.NextHop } |
-            Select-Object -First 1
-        if ($found) {
-            return $false
-        }
-    }
-    return $true
+    return (Test-HitNetSplitRoutesRemoved -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
 }
 
 function Test-RasDisconnected {
-    $status = (& rasdial.exe 2>&1 | Out-String)
-    return ($status -notmatch [regex]::Escape($RasEntry))
+    return (-not (Test-HitNetRasConnected -EntryName $RasEntry))
 }
 
 function Wait-RestoreSettled {
