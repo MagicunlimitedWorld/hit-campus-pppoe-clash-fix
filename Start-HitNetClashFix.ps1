@@ -1359,8 +1359,22 @@ $timer.Add_Tick({
                 }
             }
             else {
-                $statusLabel.Text = "操作失败。请查看输出，必要时点击一键切换回 WLAN。"
-                Append-Output "操作失败。请检查上方输出和 .runtime/logs 中的日志。"
+                if ($output -match "ENTER_PPPOE_CODEX_BUSY") {
+                    $statusLabel.Text = "已有连接流程正在执行，请稍后。"
+                    Append-Output "已有连接流程正在执行。本次请求已跳过，避免并发修改 NRPT 或 split route。"
+                }
+                elseif ($output -match "LOCAL_ENTER_REPAIR_FAILED") {
+                    $statusLabel.Text = "本地修复失败。请查看日志。"
+                    Append-Output "本地 PPPoE/Clash/NRPT/split route 修复失败。请检查上方 LOCAL_ENTER_REPAIR_FAILED 详情。"
+                }
+                elseif ($output -match "EXTERNAL_CONNECTIVITY_PROBE_FAILED") {
+                    $statusLabel.Text = "外部连通性探测失败。"
+                    Append-Output "本地修复与外部 OpenAI 探测已分开记录。请查看 EXTERNAL_CONNECTIVITY_PROBE_FAILED 详情。"
+                }
+                else {
+                    $statusLabel.Text = "操作失败。请查看输出，必要时点击切回 WLAN。"
+                    Append-Output "操作失败。请检查上方输出和 .runtime/logs 中的日志。"
+                }
                 Set-ControlsBusy -Busy $false
             }
         }

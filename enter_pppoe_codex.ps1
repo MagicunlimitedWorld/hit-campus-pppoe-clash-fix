@@ -11,6 +11,7 @@
     [int]$WatchdogTimeoutSeconds = 180,
     [int]$ConnectAttempts = 2,
     [int]$ConnectRetryDelaySeconds = 10,
+    [int]$LockWaitSeconds = 3,
     [ValidateSet("Balanced", "Full", "Minimal")]
     [string]$ProbeMode = "Balanced",
     [switch]$SkipPreRestore
@@ -52,6 +53,9 @@ $NrptComment = "CodexClashEnter temporary NRPT rule $Timestamp"
 $CreatedNrptRuleNames = New-Object System.Collections.Generic.List[string]
 $AddedRoutes = New-Object System.Collections.Generic.List[object]
 $Entered = $false
+$EnterMutexName = "Local\HitCampusPppoeClashEnter"
+$EnterMutex = $null
+$EnterMutexAcquired = $false
 
 function Write-Log {
     param([string]$Message = "")
@@ -71,6 +75,51 @@ function Invoke-Logged {
     }
     else {
         $output.TrimEnd() | Tee-Object -FilePath $LogPath -Append
+    }
+}
+
+function Acquire-EnterLock {
+    $script:EnterMutex = [System.Threading.Mutex]::new($false, $EnterMutexName)
+    $timeoutSeconds = [Math]::Max(0, $LockWaitSeconds)
+
+    try {
+        if ($timeoutSeconds -eq 0) {
+            $script:EnterMutexAcquired = $script:EnterMutex.WaitOne(0)
+        }
+        else {
+            $script:EnterMutexAcquired = $script:EnterMutex.WaitOne([TimeSpan]::FromSeconds($timeoutSeconds))
+        }
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $script:EnterMutexAcquired = $true
+    }
+
+    if (-not $script:EnterMutexAcquired) {
+        $script:EnterMutex.Dispose()
+        $script:EnterMutex = $null
+        return $false
+    }
+
+    Write-Log ("Enter lock acquired: {0}" -f $EnterMutexName)
+    return $true
+}
+
+function Release-EnterLock {
+    if ($script:EnterMutex) {
+        try {
+            if ($script:EnterMutexAcquired) {
+                $script:EnterMutex.ReleaseMutex()
+                Write-Log ("Enter lock released: {0}" -f $EnterMutexName)
+            }
+        }
+        catch {
+            Write-Log ("Enter lock release warning: {0}" -f $_.Exception.Message)
+        }
+        finally {
+            $script:EnterMutex.Dispose()
+            $script:EnterMutex = $null
+            $script:EnterMutexAcquired = $false
+        }
     }
 }
 
@@ -696,9 +745,11 @@ function Test-EnterConnectivity {
         }
 
         if (-not (Test-EnterReady)) {
-            throw "Local connectivity validation failed: ras=$(Test-RasConnected) proxy=$(Test-ProxyPortListening) tun=$(Test-TunInterfaceReady) nrpt=$(Test-NrptRulesReady) routes=$(Test-SplitRoutesReady)"
+            throw "Local enter repair failed: ras=$(Test-RasConnected) proxy=$(Test-ProxyPortListening) tun=$(Test-TunInterfaceReady) nrpt=$(Test-NrptRulesReady) routes=$(Test-SplitRoutesReady)"
         }
     }
+
+    Write-Log "LOCAL_ENTER_REPAIR_OK: PPPoE, Clash proxy, TUN, NRPT, and split routes are ready."
 
     if ($ProbeMode -eq "Minimal") {
         Write-Log "ProbeMode=Minimal; skip OpenAI HTTP probes."
@@ -754,7 +805,10 @@ function Test-EnterConnectivity {
         Write-OpenAiProbeResult -Result $proxyResult
 
         if ($directResult.Code -ne 401 -or $proxyResult.Code -ne 401) {
-            throw "Connectivity validation failed: direct=$($directResult.Code) proxy=$($proxyResult.Code)"
+            Write-Log ("EXTERNAL_CONNECTIVITY_PROBE_WARNING: local enter repair is OK, but OpenAI probe was not 401: direct={0} proxy={1}; keeping PPPoE + Clash state and avoiding rollback on transient upstream failure." -f $directResult.Code, $proxyResult.Code)
+        }
+        else {
+            Write-Log "EXTERNAL_CONNECTIVITY_PROBE_OK: OpenAI direct and via-Clash probes returned 401."
         }
         return
     }
@@ -780,8 +834,9 @@ function Test-EnterConnectivity {
     $direct = if ($directResult -match "code=(\d{3})") { $Matches[1] } else { "000" }
     $proxy = if ($proxyResult -match "code=(\d{3})") { $Matches[1] } else { "000" }
     if ($direct -ne "401" -or $proxy -ne "401") {
-        throw "Connectivity validation failed: direct=$direct proxy=$proxy"
+        throw "External connectivity probe failed: OpenAI direct=$direct proxy=$proxy"
     }
+    Write-Log "EXTERNAL_CONNECTIVITY_PROBE_OK: OpenAI direct and via-Clash probes returned 401."
 }
 
 function Restore-OnFailure {
@@ -793,6 +848,13 @@ function Restore-OnFailure {
 Write-Log ("LogPath={0}" -f $LogPath)
 Write-Log "Purpose=enter PPPoE plus Clash plus Codex-compatible NRPT/split-route environment."
 Write-Log "No credentials are stored by this script."
+Write-Log ("LockWaitSeconds={0}" -f $LockWaitSeconds)
+
+if (-not (Acquire-EnterLock)) {
+    $message = "Another enter_pppoe_codex instance is already running; skip this run to avoid concurrent NRPT/split-route changes."
+    Write-Log ("ENTER_PPPOE_CODEX_BUSY: {0}" -f $message)
+    throw $message
+}
 
 try {
     $watchdog = Start-RestoreWatchdog
@@ -836,7 +898,15 @@ try {
     Write-Log ("ENTER_PPPOE_CODEX_OK. Restore with: {0} -RasEntry {1}" -f $RestoreScript, $RasEntry)
 }
 catch {
-    Write-Log ("ENTER_PPPOE_CODEX_FAILED: {0}" -f $_.Exception.Message)
+    $failureMessage = $_.Exception.Message
+    if ($failureMessage -like "External connectivity probe failed:*") {
+        Write-Log ("EXTERNAL_CONNECTIVITY_PROBE_FAILED: {0}" -f $failureMessage)
+        Write-Log "ENTER_PPPOE_CODEX_FAILED: external connectivity probe failed in strict probe mode; rollback will run."
+    }
+    else {
+        Write-Log ("LOCAL_ENTER_REPAIR_FAILED: {0}" -f $failureMessage)
+        Write-Log "ENTER_PPPOE_CODEX_FAILED: local PPPoE/Clash/NRPT/split-route repair failed; rollback will run."
+    }
     Restore-OnFailure
     New-Item -Path $DonePath -ItemType File -Force | Out-Null
     throw
@@ -845,4 +915,5 @@ finally {
     if (-not $Entered -and -not (Test-Path -LiteralPath $DonePath)) {
         New-Item -Path $DonePath -ItemType File -Force | Out-Null
     }
+    Release-EnterLock
 }

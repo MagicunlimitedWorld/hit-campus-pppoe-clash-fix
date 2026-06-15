@@ -114,7 +114,9 @@ Start-HitNetClashFix.cmd
 .\enter_pppoe_codex.ps1 -ProbeMode Full
 ```
 
-默认 `Balanced` 会保留关键本地检查和一次 OpenAI/Clash 探测；`Minimal` 不访问 OpenAI；`Full` 输出更完整诊断。
+默认 `Balanced` 会保留关键本地检查和一次 OpenAI/Clash 探测；本地状态已就绪时，OpenAI 短时探测失败只记为警告，不会自动回滚。`Minimal` 不访问 OpenAI；`Full` 输出更完整诊断并保持更严格的探测判定。
+
+日志中 `LOCAL_ENTER_REPAIR_*` 表示本地 PPPoE、Clash、TUN、NRPT 和 split route 修复状态；`EXTERNAL_CONNECTIVITY_PROBE_*` 表示 OpenAI 等外部连通性探测状态。两类结果分开看：本地修复成功但外部探测警告，通常是上游节点、校园网出口或目标服务短时波动。
 
 仅拨号有线 PPPoE：
 

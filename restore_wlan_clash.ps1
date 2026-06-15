@@ -192,9 +192,18 @@ function Wait-RestoreSettled {
 
 function Write-FinalSnapshot {
     Invoke-Logged "final restore status" {
-        "ras_disconnected={0}" -f (Test-RasDisconnected)
-        "nrpt_removed={0}" -f (Test-CodexNrptRemoved)
-        "split_routes_removed={0}" -f (Test-CodexSplitRoutesRemoved)
+        $rasDisconnected = Test-RasDisconnected
+        $nrptRemoved = Test-CodexNrptRemoved
+        $splitRoutesRemoved = Test-CodexSplitRoutesRemoved
+        "ras_disconnected={0}" -f $rasDisconnected
+        "nrpt_removed={0}" -f $nrptRemoved
+        "split_routes_removed={0}" -f $splitRoutesRemoved
+        if ($rasDisconnected -and $nrptRemoved -and $splitRoutesRemoved) {
+            "RESTORE_LOCAL_CLEANUP_OK: RAS is disconnected and project NRPT/split routes are removed."
+        }
+        else {
+            "RESTORE_LOCAL_CLEANUP_WARNING: local cleanup did not fully settle; inspect ras_disconnected/nrpt_removed/split_routes_removed above."
+        }
     }
 
     if ($ProbeMode -eq "Full") {
@@ -240,14 +249,14 @@ function Write-FinalSnapshot {
                 $result = & curl.exe -I -L --connect-timeout 3 --max-time 8 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
                 "attempt $attempt/$attempts $result"
                 if ($result -match "code=(?!000)\d{3}") {
-                    "PROXY_PROBE_OK"
+                    "EXTERNAL_CONNECTIVITY_PROBE_OK: final Clash proxy OpenAI probe returned a HTTP code."
                     return
                 }
                 if ($attempt -lt $attempts) {
                     Start-Sleep -Seconds ([Math]::Max(1, $ProbeRetryDelaySeconds))
                 }
             }
-            "PROXY_PROBE_FAILED_AFTER_${attempts}_ATTEMPTS"
+            "EXTERNAL_CONNECTIVITY_PROBE_WARNING: restore local cleanup is complete, but final Clash proxy OpenAI probe did not return a HTTP code after ${attempts} attempt(s)."
         }
     }
     elseif ($ProbeMode -eq "Minimal") {
@@ -267,4 +276,4 @@ Disconnect-RasIfNeeded
 Remove-StateFile
 Wait-RestoreSettled
 Write-FinalSnapshot
-Write-Log "RESTORE_WLAN_CLASH_DONE"
+Write-Log "RESTORE_WLAN_CLASH_DONE: local restore workflow completed; external probe warnings above are informational."
