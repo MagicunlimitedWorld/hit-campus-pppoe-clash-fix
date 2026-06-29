@@ -5,7 +5,28 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$PowerShellExe = Join-Path $PSHOME "powershell.exe"
+$PSHOMEValue = $PSHOME
+$PowerShellExe = Join-Path $PSHOMEValue "powershell.exe"
+if (-not (Test-Path -LiteralPath $PowerShellExe)) {
+    if ($PSHOMEValue -match "WindowsApps") {
+        # PSHOME from modern packaged PowerShell can point to unavailable path on some hosts.
+        $PowerShellExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+        if (-not $PowerShellExe) {
+            $PowerShellExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+        }
+    }
+}
+if (-not $PowerShellExe -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+    $PowerShellExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+}
+if (-not $PowerShellExe -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+    throw "Cannot resolve a working PowerShell executable in PATH."
+}
+$RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
+if (-not (Test-Path -LiteralPath $RuntimeScript)) {
+    throw "Runtime helper not found: $RuntimeScript"
+}
+. $RuntimeScript
 
 function Write-Check {
     param([string]$Message)
@@ -23,6 +44,63 @@ function Invoke-Check {
     Write-Check ("OK {0}" -f $Name)
 }
 
+function New-TempRasPhoneBook {
+    param([string]$Path)
+
+    $content = @'
+[HITnet]
+Type=5
+PBVersion=8
+DialParamsUID=12345
+Guid=TESTGUID
+
+[OfficeNet]
+Type=5
+PBVersion=8
+DialParamsUID=67890
+Guid=OFFICEGUID
+'@
+    Set-Content -Path $Path -Value $content -Encoding UTF8
+    return $Path
+}
+
+function Invoke-RasEntryParserChecks {
+    Write-Check "RasEntry parser checks"
+
+    $tmpRoot = Join-Path $ScriptDir ".runtime\\parser-test"
+    if (-not (Test-Path -LiteralPath $tmpRoot)) {
+        New-Item -Path $tmpRoot -ItemType Directory -Force | Out-Null
+    }
+
+    $pbk = Join-Path $tmpRoot "rasphone.pbk"
+    try {
+        New-TempRasPhoneBook -Path $pbk | Out-Null
+
+        $entries = Get-HitNetRasEntries -RasPhonePaths @($pbk)
+        if (-not (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry "HITnet")) {
+            throw "Expected RasEntry HITnet not found."
+        }
+        if (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry "NotExist") {
+            throw "Unexpected RasEntry NotExist was found."
+        }
+
+        $summary = Get-HitNetRasEntriesSummary -RasEntries $entries
+        if ($summary -notmatch "HITnet|OfficeNet") {
+            throw "Ras entry summary missing expected entries."
+        }
+
+        $hint = Get-HitNetRasFailureHint -RasOutput "Remote failure: error 623." -RasEntries $entries -RasEntry "NoEntry"
+        if (-not ($hint -match "rasphone\.exe -a" -and $hint -match "(?i)NoEntry|not found|not found in rasphone")) {
+            throw "Failure hint for 623 is not actionable or missing the candidate entry name."
+        }
+
+        Write-Check "Ras entry parser checks passed"
+    }
+    finally {
+        Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-ProjectScriptFiles {
     Get-ChildItem -LiteralPath $ScriptDir -Recurse -Filter "*.ps1" -File |
         Where-Object {
@@ -34,6 +112,8 @@ function Get-ProjectScriptFiles {
 }
 
 function New-AutoConnectSelfTestSettings {
+    param([string]$RasEntry = "SelfTestRas")
+
     $settingsDir = Join-Path $ScriptDir ".local"
     if (-not (Test-Path -LiteralPath $settingsDir)) {
         New-Item -Path $settingsDir -ItemType Directory -Force | Out-Null
@@ -48,7 +128,7 @@ function New-AutoConnectSelfTestSettings {
         PasswordProtected = ConvertFrom-SecureString $secure
         AutoCloseOnSuccess = $false
         AutoConnectOnLogon = $false
-        RasEntry = "SelfTestRas"
+        RasEntry = $RasEntry
         ProxyUrl = "http://127.0.0.1:18080"
         TunInterfaceAlias = "SelfTestTun"
         TunIpv4Gateway = "198.18.0.2"
@@ -116,10 +196,59 @@ try {
     Invoke-Check -Name "auto-connect ValidateOnly" -Script {
         $testSettings = New-AutoConnectSelfTestSettings
         try {
-            Invoke-ExternalPowerShell -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"), "-SettingsPath", $testSettings, "-ValidateOnly") -RequiredToken "AUTO_CONNECT_VALIDATE_OK"
+            $rasEntries = @(Get-HitNetRasEntries)
+            if (-not $rasEntries -or $rasEntries.Count -eq 0) {
+                Write-Check "SKIP auto-connect ValidateOnly (no rasphone entries detected in this environment)."
+            }
+            else {
+                $testSettings = New-AutoConnectSelfTestSettings -RasEntry ([string]$rasEntries[0])
+                Invoke-ExternalPowerShell -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"), "-SettingsPath", $testSettings, "-ValidateOnly") -RequiredToken "AUTO_CONNECT_VALIDATE_OK"
+            }
         }
         finally {
             Remove-Item -LiteralPath $testSettings -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-Check -Name "auto-connect ValidateOnly missing RasEntry" -Script {
+        $missingName = "SelfTestNotExist"
+        $testSettings = New-AutoConnectSelfTestSettings -RasEntry $missingName
+        try {
+            $output = Invoke-NativeCapture -Script {
+                & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1") -SettingsPath $testSettings -ValidateOnly
+            }
+            if ($LASTEXITCODE -eq 0 -or $output -notmatch "RAS_ENTRY_NOT_FOUND") {
+                throw ("auto-connect missing RasEntry should fail with RAS_ENTRY_NOT_FOUND. Output: {0}" -f $output.Trim())
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $testSettings -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-Check -Name "enter missing RasEntry precheck" -Script {
+        $enterScript = Join-Path $ScriptDir "enter_pppoe_codex.ps1"
+        $output = Invoke-NativeCapture -Script {
+            & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $enterScript -RasEntry "SelfTestNotExist" -LockWaitSeconds 0 -ProbeMode Minimal
+        }
+        if ($LASTEXITCODE -eq 0 -or $output -notmatch "RAS_ENTRY_NOT_FOUND") {
+            throw ("enter missing RasEntry should fail with RAS_ENTRY_NOT_FOUND. Output: {0}" -f $output.Trim())
+        }
+        if ($output -match "pre-clean stale Codex|NRPT before enter|routes before enter|RESTORE_WLAN_CLASH") {
+            throw ("enter missing RasEntry reached a mutation or restore stage. Output: {0}" -f $output.Trim())
+        }
+    }
+
+    Invoke-Check -Name "pppoe-only missing RasEntry precheck" -Script {
+        $pppoeOnlyScript = Join-Path $ScriptDir "connect_pppoe_only.ps1"
+        $output = Invoke-NativeCapture -Script {
+            & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $pppoeOnlyScript -RasEntry "SelfTestNotExist" -ConnectAttempts 1
+        }
+        if ($LASTEXITCODE -eq 0 -or $output -notmatch "RAS_ENTRY_NOT_FOUND") {
+            throw ("pppoe-only missing RasEntry should fail with RAS_ENTRY_NOT_FOUND. Output: {0}" -f $output.Trim())
+        }
+        if ($output -match "HIT 校园网账号|Dial PPPoE only attempt") {
+            throw ("pppoe-only missing RasEntry reached credential prompt or dial attempt. Output: {0}" -f $output.Trim())
         }
     }
 
@@ -169,6 +298,10 @@ try {
             throw ($hits -join [Environment]::NewLine)
         }
         Write-Check ("scanned_files={0}" -f $files.Count)
+    }
+
+    Invoke-Check -Name "RasEntry parser" -Script {
+        Invoke-RasEntryParserChecks
     }
 
     if ($IncludeBusyLockCheck) {

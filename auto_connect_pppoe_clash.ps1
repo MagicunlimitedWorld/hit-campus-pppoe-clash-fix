@@ -89,6 +89,14 @@ function Test-SplitRoutesReady {
     return (Test-HitNetSplitRoutesReady -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
 }
 
+function Assert-RasEntryConfig {
+    $entries = Get-HitNetRasEntries
+    Write-AutoLog ("Ras phonebook scan: {0}" -f (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    if (-not (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry $Config.RasEntry)) {
+        throw ("RAS_ENTRY_NOT_FOUND: no entry named '{0}' in rasphone.pbk. Available: {1}. Recreate/fix via 'rasphone.exe -a' and keep exact name." -f $Config.RasEntry, (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    }
+}
+
 function Test-AlreadyConnected {
     param($Config)
 
@@ -109,12 +117,13 @@ Write-AutoLog ("SettingsPath={0}" -f $SettingsPath)
 Write-AutoLog ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2} ClashPath={3}" -f $Config.RasEntry, $Config.ProxyUrl, $Config.TunInterfaceAlias, $Config.ClashPath)
 
 try {
-    $credential = Get-SavedCredential
+    Assert-RasEntryConfig
     if ($ValidateOnly) {
         Write-AutoLog "AUTO_CONNECT_VALIDATE_OK"
         return
     }
 
+    $credential = Get-SavedCredential
     if (Test-AlreadyConnected -Config $Config) {
         Write-AutoLog "AUTO_CONNECT_ALREADY_OK"
         return

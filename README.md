@@ -147,7 +147,9 @@ Resolve-DnsName api.openai.com -Type A -DnsOnly
 - TUN 已提前创建 split route：工具会复用现有路由，不会因此判定连接失败。
 - 已处于 PPPoE + Clash 修复状态：工具会走快速路径，不断开、不重拨。
 - 仅拨号模式仍经过 Clash：说明 Clash TUN 或系统代理已经在本机启用；该模式不会替你关闭或修改 Clash，请在 Clash 中手动关闭 TUN/系统代理后再试。
+- RAS `623`：通常是电话簿连接项未找到（或读取不到 `rasphone.pbk`）。确认 `Settings` 中 `RasEntry` 与 Windows 电话簿中的 PPPoE 名称完全一致；若不一致，用 `rasphone.exe -a` 重新创建同名条目。系统会在预检阶段提示可见连接项与修复动作，未匹配时直接返回 `RAS_ENTRY_NOT_FOUND`。
 - RAS `629`：通常是校园侧终止 PPPoE 认证/注册。等待 1-2 分钟后重试，若持续出现，请检查账号权限、在线会话限制、墙口/交换机端口、VLAN 或 PPPoE 服务状态。
+- Office 登录失败（例如 Microsoft Store / Word 等）：本项目不改 Office 登录策略。若在开启系统代理时登录受阻，可先关闭系统代理测试；如果可恢复，说明是代理策略对该应用的影响，后续可采用按需重试或临时关闭系统代理。
 - 无法恢复：运行 `restore_wlan_clash.ps1`。脚本只清理本项目创建的临时 NRPT 和 split route。
 
 ## 安全说明

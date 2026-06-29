@@ -337,8 +337,12 @@ function Get-DetailedStatusText {
             $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
         } |
         Select-Object -First 1)
-    $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+    $rasEntries = Get-HitNetRasEntries
+    $rasEntriesSummary = Get-HitNetRasEntriesSummary -RasEntries $rasEntries
+    $rasEntryExists = Test-HitNetRasEntryExists -RasEntries $rasEntries -RasEntry $cfg.RasEntry
+    $summary = "{0}({1}): {2}    Clash: {3}    TUN: {4}    有线: {5}    状态文件: {6}    自启: {7}" -f `
         $cfg.RasEntry,
+        $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }),
         $(if ($ras -match [regex]::Escape($cfg.RasEntry)) { "已连接" } else { "未连接" }),
         $(if ($proxyListening) { "已监听" } else { "未监听" }),
         $(if ($tunAdapter -and $tunAdapter.Status -eq "Up") { "已就绪" } else { "未就绪" }),
@@ -352,6 +356,8 @@ function Get-DetailedStatusText {
     $lines.Add(("PPPoE: {0}" -f $cfg.RasEntry)) | Out-Null
     $lines.Add(("Proxy: {0}" -f $cfg.ProxyUrl)) | Out-Null
     $lines.Add(("TUN: {0}" -f $cfg.TunInterfaceAlias)) | Out-Null
+    $lines.Add(("PPPoE项检测: {0} ({1})" -f $cfg.RasEntry, $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }))) | Out-Null
+    $lines.Add(("PPPoE项清单: {0}" -f $rasEntriesSummary)) | Out-Null
     $lines.Add(("ClashPath: {0}" -f $cfg.ClashPath)) | Out-Null
     $lines.Add(("状态文件路径: {0}" -f $StatePath)) | Out-Null
     $lines.Add($taskText) | Out-Null
@@ -801,9 +807,13 @@ function Start-StatusRefreshJob {
             $ethernetReady = Test-TargetEthernetReady -Config $Config
             $stateExists = Test-Path -LiteralPath $StatePathValue
             $taskSnapshot = Get-TaskSnapshot -TaskName $TaskName
+            $rasEntries = Get-HitNetRasEntries
+            $rasEntriesSummary = Get-HitNetRasEntriesSummary -RasEntries $rasEntries
+            $rasEntryExists = Test-HitNetRasEntryExists -RasEntries $rasEntries -RasEntry $Config.RasEntry
 
-            $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+            $summary = "{0}({1}): {2}    Clash: {3}    TUN: {4}    有线: {5}    状态文件: {6}    自启: {7}" -f `
                 $Config.RasEntry,
+                $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }),
                 $(if ($rasConnected) { "已连接" } else { "未连接" }),
                 $(if ($proxyListening) { "已监听" } else { "未监听" }),
                 $(if ($tunReady) { "已就绪" } else { "未就绪" }),
@@ -817,6 +827,9 @@ function Start-StatusRefreshJob {
             }
             if (-not $proxyListening) {
                 $hintLines.Add("Clash 代理端口未监听：先启动 Clash Verge，并确认代理地址/端口正确。") | Out-Null
+            }
+            if (-not $rasEntryExists) {
+                $hintLines.Add(("未在 rasphone.pbk 中检测到 PPPoE 项 '{0}'。建议先执行 'rasphone.exe -a' 并确认名称一致。当前可见项：{1}" -f $Config.RasEntry, $rasEntriesSummary)) | Out-Null
             }
             if (-not $tunReady) {
                 $hintLines.Add("TUN 未就绪：先在 Clash Verge 中开启 TUN/Meta 网卡。") | Out-Null
@@ -883,6 +896,8 @@ function Start-StatusRefreshJob {
             $lines.Add(("PPPoE: {0}" -f $Config.RasEntry)) | Out-Null
             $lines.Add(("Proxy: {0}" -f $Config.ProxyUrl)) | Out-Null
             $lines.Add(("TUN: {0}" -f $Config.TunInterfaceAlias)) | Out-Null
+            $lines.Add(("PPPoE项检测: {0} ({1})" -f $Config.RasEntry, $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }))) | Out-Null
+            $lines.Add(("PPPoE项清单: {0}" -f $rasEntriesSummary)) | Out-Null
             $lines.Add(("ClashPath: {0}" -f $Config.ClashPath)) | Out-Null
             $lines.Add(("状态文件路径: {0}" -f $StatePathValue)) | Out-Null
             $lines.Add($taskSnapshot.Text) | Out-Null

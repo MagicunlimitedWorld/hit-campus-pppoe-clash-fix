@@ -109,6 +109,14 @@ function Test-RasConnected {
     return (Test-HitNetRasConnected -EntryName $EntryName)
 }
 
+function Assert-RasEntryExists {
+    $entries = Get-HitNetRasEntries
+    if (-not (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry $RasEntry)) {
+        throw ("RAS_ENTRY_NOT_FOUND: no entry named '{0}' in rasphone.pbk. Available: {1}. Recreate/fix via 'rasphone.exe -a' and keep exact name." -f $RasEntry, (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    }
+    return $entries
+}
+
 function Get-ExistingClashRouteSummary {
     $expected = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
     $routes = Get-NetRoute -DestinationPrefix ($expected.Prefix) -ErrorAction SilentlyContinue |
@@ -168,6 +176,7 @@ if (Test-RasConnected -EntryName $RasEntry) {
     Write-Log ("PPPoE is already connected: {0}" -f $RasEntry)
 }
 else {
+    $null = Assert-RasEntryExists
     $cred = Get-RasCredential
     Connect-RasOnly -Cred $cred
 }
