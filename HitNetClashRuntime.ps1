@@ -73,6 +73,128 @@ function Test-HitNetRasConnected {
     }
 }
 
+function Get-HitNetRasEntries {
+    param([string[]]$RasPhonePaths)
+
+    $candidatePaths = @()
+    if ($RasPhonePaths -and $RasPhonePaths.Count -gt 0) {
+        foreach ($path in @($RasPhonePaths)) {
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                continue
+            }
+            $candidatePaths += [Environment]::ExpandEnvironmentVariables($path.Trim())
+        }
+    }
+    else {
+        $candidatePaths += Join-Path $env:APPDATA "Microsoft\Network\Connections\Pbk\rasphone.pbk"
+        $candidatePaths += Join-Path $env:ALLUSERSPROFILE "Microsoft\Network\Connections\Pbk\rasphone.pbk"
+        $candidatePaths += Join-Path $env:ProgramData "Microsoft\Network\Connections\Pbk\rasphone.pbk"
+    }
+
+    $entries = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $candidatePaths | Select-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+
+        try {
+            $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        $sectionName = ""
+        $sectionLines = New-Object System.Collections.Generic.List[string]
+        $emitSection = {
+            param(
+                [string]$Name,
+                [System.Collections.Generic.List[string]]$Lines
+            )
+
+            if ([string]::IsNullOrWhiteSpace($Name)) {
+                return
+            }
+
+            if ($Name -match "(?i)^(global|media|connection|modem|authentication|general|phonebook|network|dns)$") {
+                return
+            }
+
+            $isRasEntry = $false
+            foreach ($line in $Lines) {
+                if ($line -match "(?i)^(Type|PBVersion|PhoneNumber|DialParamsUID|PreferredDevice)=") {
+                    $isRasEntry = $true
+                    break
+                }
+            }
+            if (-not $isRasEntry) {
+                return
+            }
+
+            $trimmed = $Name.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+                if ($entries -notcontains $trimmed) {
+                    $entries.Add($trimmed) | Out-Null
+                }
+            }
+        }
+
+        foreach ($line in ($content -split "`r?`n")) {
+            if ($line -match "^\[(.+)\]\s*$") {
+                if (-not [string]::IsNullOrWhiteSpace($sectionName)) {
+                    & $emitSection -Name $sectionName -Lines $sectionLines
+                }
+                $sectionName = $Matches[1]
+                $sectionLines.Clear()
+            }
+            else {
+                if (-not [string]::IsNullOrWhiteSpace($sectionName)) {
+                    $sectionLines.Add($line) | Out-Null
+                }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($sectionName)) {
+            & $emitSection -Name $sectionName -Lines $sectionLines
+        }
+    }
+
+    return ($entries | Sort-Object)
+}
+
+function Test-HitNetRasEntryExists {
+    param(
+        [string[]]$RasEntries,
+        [string]$RasEntry
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RasEntry) -or -not $RasEntries) {
+        return $false
+    }
+    foreach ($entry in @($RasEntries)) {
+        if (-not [string]::IsNullOrWhiteSpace($entry) -and $entry.Trim().Equals($RasEntry.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-HitNetRasEntriesSummary {
+    param(
+        [string[]]$RasEntries,
+        [int]$MaxEntries = 20
+    )
+
+    if (-not $RasEntries -or $RasEntries.Count -eq 0) {
+        return "未检测到 RasEntry"
+    }
+
+    $shown = @($RasEntries | Select-Object -First $MaxEntries)
+    if ($RasEntries.Count -gt $MaxEntries) {
+        return ("检测到 {0} 个 RasEntry: {1} ..." -f $RasEntries.Count, ($shown -join ", "))
+    }
+    return ("检测到 {0} 个 RasEntry: {1}" -f $RasEntries.Count, ($RasEntries -join ", "))
+}
+
 function Test-HitNetProxyPortListening {
     param(
         [Parameter(Mandatory = $true)]
@@ -427,18 +549,30 @@ function Write-HitNetOpenAiProbeResult {
 }
 
 function Get-HitNetRasFailureHint {
-    param([string]$RasOutput)
+    param(
+        [string]$RasOutput,
+        [string[]]$RasEntries = @(),
+        [string]$RasEntry
+    )
 
-    if ($RasOutput -match "(?i)(error|\u9519\u8BEF)\s*629| 629 ") {
+    if ($RasOutput -match "(?i)(error).*623") {
+        if (Test-HitNetRasEntryExists -RasEntries $RasEntries -RasEntry $RasEntry) {
+            return "RAS_ERROR_623: entry exists but PPPoE handshake did not start correctly. Check credentials/account status first, then retry after network/VLAN recovery."
+        }
+        $summary = Get-HitNetRasEntriesSummary -RasEntries $RasEntries
+        return "RAS_ERROR_623: RasEntry '{0}' not found in rasphone.pbk. {1}. Suggested action: run 'rasphone.exe -a' and confirm the exact PPPoE name matches the config." -f $RasEntry, $summary
+    }
+
+    if ($RasOutput -match "(?i)(error).*629") {
         return "RAS_ERROR_629: remote side terminated PPPoE during authentication/registration. Common causes: wrong password, campus account/session restriction, PPPoE server/port/VLAN rejecting the session, or retrying too soon after a previous session."
     }
-    if ($RasOutput -match "(?i)(error|\u9519\u8BEF)\s*691| 691 ") {
+    if ($RasOutput -match "(?i)(error).*691") {
         return "RAS_ERROR_691: authentication failed. Re-enter the campus account password carefully."
     }
-    if ($RasOutput -match "(?i)(error|\u9519\u8BEF)\s*651| 651 ") {
+    if ($RasOutput -match "(?i)(error).*651") {
         return "RAS_ERROR_651: PPPoE server or physical link did not respond. Check Ethernet link, wall port, VLAN, and campus PPPoE availability."
     }
-    if ($RasOutput -match "(?i)(error|\u9519\u8BEF)\s*633| 633 ") {
+    if ($RasOutput -match "(?i)(error).*633") {
         return "RAS_ERROR_633: modem/PPPoE device is already in use. Disconnect stale PPPoE sessions and retry."
     }
     return "RAS_ERROR_UNKNOWN: PPPoE did not connect; inspect the preceding rasdial output."

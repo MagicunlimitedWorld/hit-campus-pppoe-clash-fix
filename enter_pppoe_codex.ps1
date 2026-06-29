@@ -210,6 +210,22 @@ function Test-RasConnected {
     return (Test-HitNetRasConnected -EntryName $RasEntry)
 }
 
+function Get-KnownRasEntries {
+    return (Get-HitNetRasEntries)
+}
+
+function Assert-RasEntryExists {
+    $entries = Get-KnownRasEntries
+    Write-Log ("Ras phonebook scan: {0}" -f (Get-HitNetRasEntriesSummary -RasEntries $entries))
+
+    if (-not (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry $RasEntry)) {
+        throw ("RAS_ENTRY_NOT_FOUND: no entry named '{0}' in rasphone.pbk. Output: {1}. Recreate/fix via 'rasphone.exe -a' and keep exact name." -f $RasEntry, (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    }
+
+    Write-Log ("Ras phonebook check passed: found '{0}'." -f $RasEntry)
+    return $entries
+}
+
 function Test-TunInterfaceReady {
     return (Test-HitNetTunReady -TunInterfaceAlias $TunInterfaceAlias)
 }
@@ -356,7 +372,10 @@ function Initialize-ColdStartPrerequisites {
 }
 
 function Connect-Ras {
-    param([pscredential]$Cred)
+    param(
+        [pscredential]$Cred,
+        [string[]]$KnownRasEntries = @()
+    )
 
     if (Test-RasConnected) {
         Write-Log ("RAS entry {0} is already connected; skip dialing." -f $RasEntry)
@@ -390,14 +409,14 @@ function Connect-Ras {
             Start-Sleep -Seconds 1
         }
 
-        Write-Log (Get-RasFailureHint -RasOutput $lastOutput)
+        Write-Log (Get-RasFailureHint -RasOutput $lastOutput -RasEntries $KnownRasEntries -RasEntry $RasEntry)
         if ($attempt -lt $attempts) {
             Write-Log ("RAS entry {0} not connected; retrying after {1}s." -f $RasEntry, $ConnectRetryDelaySeconds)
             Start-Sleep -Seconds ([Math]::Max(1, $ConnectRetryDelaySeconds))
         }
     }
 
-    throw ("RAS entry {0} did not connect after {1} attempt(s). Last hint: {2}" -f $RasEntry, $attempts, (Get-RasFailureHint -RasOutput $lastOutput))
+    throw ("RAS entry {0} did not connect after {1} attempt(s). Last hint: {2}" -f $RasEntry, $attempts, (Get-RasFailureHint -RasOutput $lastOutput -RasEntries $KnownRasEntries -RasEntry $RasEntry))
 }
 
 function Get-RasFailureHint {
@@ -679,11 +698,12 @@ try {
         return
     }
 
+    $knownRasEntries = Assert-RasEntryExists
     PreRestore
     Initialize-ColdStartPrerequisites
     if (-not (Test-RasConnected)) {
         $cred = Get-CredentialForRas
-        Connect-Ras -Cred $cred
+        Connect-Ras -Cred $cred -KnownRasEntries $knownRasEntries
     }
     else {
         Write-Log ("RAS entry {0} is already connected after pre-clean; skip credential prompt and dialing." -f $RasEntry)
@@ -704,15 +724,20 @@ try {
 }
 catch {
     $failureMessage = $_.Exception.Message
-    if ($failureMessage -like "External connectivity probe failed:*") {
+    if ($failureMessage -like "RAS_ENTRY_NOT_FOUND:*") {
+        Write-Log ("RAS_ENTRY_NOT_FOUND: {0}" -f $failureMessage)
+        Write-Log "ENTER_PPPOE_CODEX_FAILED: RasEntry precheck failed before NRPT/split-route changes; rollback skipped."
+    }
+    elseif ($failureMessage -like "External connectivity probe failed:*") {
         Write-Log ("EXTERNAL_CONNECTIVITY_PROBE_FAILED: {0}" -f $failureMessage)
         Write-Log "ENTER_PPPOE_CODEX_FAILED: external connectivity probe failed in strict probe mode; rollback will run."
+        Restore-OnFailure
     }
     else {
         Write-Log ("LOCAL_ENTER_REPAIR_FAILED: {0}" -f $failureMessage)
         Write-Log "ENTER_PPPOE_CODEX_FAILED: local PPPoE/Clash/NRPT/split-route repair failed; rollback will run."
+        Restore-OnFailure
     }
-    Restore-OnFailure
     New-Item -Path $DonePath -ItemType File -Force | Out-Null
     throw
 }
