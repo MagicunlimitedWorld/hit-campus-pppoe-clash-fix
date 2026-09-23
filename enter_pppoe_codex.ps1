@@ -60,7 +60,19 @@ $CreatedNrptRuleNames = New-Object System.Collections.Generic.List[string]
 $AddedRoutes = New-Object System.Collections.Generic.List[object]
 $ReconcileAddedNrptRuleNames = New-Object System.Collections.Generic.List[string]
 $ReconcileAddedRoutes = New-Object System.Collections.Generic.List[object]
+$ReconcileAddedNrptRules = New-Object System.Collections.Generic.List[object]
 $Entered = $false
+$script:OperationCommitted = $false
+$script:OperationDial = $null
+$script:PreviousActiveState = $null
+$OperationCreatedRoutes = New-Object System.Collections.Generic.List[object]
+$OperationCreatedNrptRules = New-Object System.Collections.Generic.List[object]
+$script:DesiredNrptRules = @()
+$JournalPath = Join-Path $RuntimeStateDir ("operation_{0}.json" -f $Timestamp)
+function Save-OperationJournal {
+    $journal = [pscustomobject]@{ OperationId=$Timestamp; Routes=@($OperationCreatedRoutes.ToArray()); NrptRules=@($OperationCreatedNrptRules.ToArray()) }
+    Write-HitNetJsonAtomic -Path $JournalPath -InputObject $journal
+}
 $EnterMutexName = "Local\HitCampusPppoeClashEnter"
 $EnterMutexState = New-HitNetNamedMutexState -Name $EnterMutexName
 
@@ -92,11 +104,7 @@ function Assert-WorkspacePath {
     }
 }
 
-function Get-PlainPasswordFromCredential {
-    param([pscredential]$Cred)
 
-    return (Get-HitNetPlainPasswordFromCredential -Credential $Cred)
-}
 
 function Read-NonEmptyValue {
     param(
@@ -145,64 +153,18 @@ function Get-CredentialForRas {
 }
 
 function Start-RestoreWatchdog {
-    $escapedDone = $DonePath.Replace("'", "''")
-    $escapedLog = $WatchdogLogPath.Replace("'", "''")
-    $escapedRestore = $RestoreScript.Replace("'", "''")
-    $escapedRasEntry = $RasEntry.Replace("'", "''")
-    $escapedProxyUrl = $ProxyUrl.Replace("'", "''")
-    $escapedTunAlias = $TunInterfaceAlias.Replace("'", "''")
-    $escapedTunV4 = $TunIpv4Gateway.Replace("'", "''")
-    $escapedTunV6 = $TunIpv6Gateway.Replace("'", "''")
-    $timeout = [Math]::Max(30, $WatchdogTimeoutSeconds)
-
-    $watchdogScript = @"
-`$ErrorActionPreference = 'Continue'
-`$done = '$escapedDone'
-`$log = '$escapedLog'
-`$restore = '$escapedRestore'
-`$ras = '$escapedRasEntry'
-`$proxy = '$escapedProxyUrl'
-`$tun = '$escapedTunAlias'
-`$tunV4 = '$escapedTunV4'
-`$tunV6 = '$escapedTunV6'
-function Add-WatchdogLog([string]`$m) { Add-Content -LiteralPath `$log -Value ((Get-Date -Format 'yyyy-MM-ddTHH:mm:ss') + ' ' + `$m) }
-Add-WatchdogLog 'watchdog started; timeout=${timeout}s'
-for (`$i = 0; `$i -lt $([Math]::Ceiling($timeout / 5)); `$i++) {
-    if (Test-Path -LiteralPath `$done) { Add-WatchdogLog 'done marker found; exiting'; exit 0 }
-    Start-Sleep -Seconds 5
-}
-Add-WatchdogLog 'timeout reached; running restore script'
-& `$restore -RasEntry `$ras -ProxyUrl `$proxy -TunInterfaceAlias `$tun -TunIpv4Gateway `$tunV4 -TunIpv6Gateway `$tunV6 -SkipProbe -Reason 'enter watchdog timeout' 2>&1 | Add-Content -LiteralPath `$log
-"@
-
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($watchdogScript))
-    $powershellExe = Join-Path $PSHOME "powershell.exe"
-    return Start-Process -FilePath $powershellExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) -WindowStyle Hidden -PassThru
+    $watcher = Join-Path $ScriptDir 'Watch-HitNetOperation.ps1'
+    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -JournalPath "{1}" -DonePath "{2}" -LogPath "{3}" -TimeoutSeconds {4}' -f $watcher,$JournalPath,$DonePath,$WatchdogLogPath,([Math]::Max(30,$WatchdogTimeoutSeconds))
+    Start-Process -FilePath $powershellExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
 }
 
 function PreRestore {
-    if ($SkipPreRestore) {
-        Write-Log "Pre-restore skipped by parameter."
-        return
+    # Compatibility name: entering a session no longer pre-cleans working routes or active intent.
+    if ($script:PreviousActiveState -and ($script:PreviousActiveState.RasEntry -ne $RasEntry -or $script:PreviousActiveState.TunInterfaceAlias -ne $TunInterfaceAlias)) {
+        throw 'ACTIVE_STATE_MISMATCH: restore the previous session explicitly before changing its PPPoE/TUN binding.'
     }
-
-    Invoke-Logged "pre-clean stale Codex NRPT rules without disconnecting RAS" {
-        Remove-HitNetProjectNrptRules
-    }
-
-    Invoke-Logged "pre-clean stale Codex split routes without disconnecting RAS" {
-        Remove-HitNetSplitRoutes -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway
-    }
-
-    Invoke-Logged "pre-clean active state file" {
-        if (Test-Path -LiteralPath $StatePath) {
-            Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
-            "Removed $StatePath"
-        }
-        else {
-            "State file not found: $StatePath"
-        }
-    }
+    Write-Log 'Existing networking is retained; only missing compatible resources will be added.'
 }
 
 function Test-ProxyPortListening {
@@ -252,36 +214,15 @@ function Test-EnterReady {
 }
 
 function Capture-ExistingEnterState {
-    $CreatedNrptRuleNames.Clear()
     $AddedRoutes.Clear()
-
-    foreach ($namespace in $NrptNamespaces) {
-        $rule = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object {
-                ($_.Namespace -contains $namespace -or $_.Namespace -eq $namespace) -and
-                ($_.NameServers -contains "198.18.0.2" -or $_.NameServers -eq "198.18.0.2")
-            } |
-            Select-Object -First 1
-        if ($rule -and $rule.Name) {
-            $CreatedNrptRuleNames.Add($rule.Name) | Out-Null
+    $script:DesiredNrptRules = @(foreach ($rule in @(Get-DnsClientNrptRule -ErrorAction Stop)) {
+        if (@($rule.Namespace | Where-Object { $_ -in $NrptNamespaces }).Count -and @($rule.NameServers) -contains '198.18.0.2') {
+            Get-HitNetNrptRecord -Rule $rule -PreviousRules @($script:PreviousActiveState.NrptRules)
         }
-    }
-
-    foreach ($route in @(
-        @{ Prefix = "0.0.0.0/1"; NextHop = $TunIpv4Gateway; Family = "IPv4" },
-        @{ Prefix = "128.0.0.0/1"; NextHop = $TunIpv4Gateway; Family = "IPv4" },
-        @{ Prefix = "::/1"; NextHop = $TunIpv6Gateway; Family = "IPv6" },
-        @{ Prefix = "8000::/1"; NextHop = $TunIpv6Gateway; Family = "IPv6" }
-    )) {
-        $found = Get-NetRoute -DestinationPrefix $route.Prefix -InterfaceAlias $TunInterfaceAlias -NextHop $route.NextHop -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($found) {
-            $AddedRoutes.Add([pscustomobject]@{
-                DestinationPrefix = $route.Prefix
-                InterfaceIndex = $found.InterfaceIndex
-                NextHop = $route.NextHop
-                AddressFamily = $route.Family
-            }) | Out-Null
+    })
+    foreach ($route in @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)) {
+        foreach ($found in @(Get-NetRoute -PolicyStore ActiveStore -DestinationPrefix $route.Prefix -InterfaceAlias $TunInterfaceAlias -NextHop $route.NextHop -ErrorAction Stop)) {
+            $AddedRoutes.Add((New-HitNetRouteRecord -Route $found -PreviousRoutes @($script:PreviousActiveState.Routes)))
         }
     }
 }
@@ -375,51 +316,20 @@ function Initialize-ColdStartPrerequisites {
 }
 
 function Connect-Ras {
-    param(
-        [pscredential]$Cred,
-        [string[]]$KnownRasEntries = @()
-    )
-
-    if (Test-RasConnected) {
-        Write-Log ("RAS entry {0} is already connected; skip dialing." -f $RasEntry)
-        return
-    }
-
+    param([pscredential]$Cred, [string[]]$KnownRasEntries = @())
     $attempts = [Math]::Max(1, $ConnectAttempts)
-    $lastOutput = ""
     for ($attempt = 1; $attempt -le $attempts; $attempt++) {
-        Write-Log ("=== connect RAS entry {0}, attempt {1}/{2} ===" -f $RasEntry, $attempt, $attempts)
-        $plainPassword = $null
         try {
-            $plainPassword = Get-PlainPasswordFromCredential -Cred $Cred
-            $lastOutput = (& rasdial.exe $RasEntry $Cred.UserName $plainPassword 2>&1 | Out-String -Width 4096)
-            if ([string]::IsNullOrWhiteSpace($lastOutput)) {
-                "(no output)" | Tee-Object -FilePath $LogPath -Append
-            }
-            else {
-                $lastOutput.TrimEnd() | Tee-Object -FilePath $LogPath -Append
-            }
+            $script:OperationDial = Invoke-HitNetRasDial -RasEntry $RasEntry -Credential $Cred
+            Write-Log ("RAS entry {0} ready on attempt {1}; reused={2}." -f $RasEntry, $attempt, (-not $script:OperationDial.Created))
+            return
         }
-        finally {
-            $plainPassword = $null
-        }
-
-        for ($i = 0; $i -lt 12; $i++) {
-            if (Test-RasConnected) {
-                Write-Log ("RAS entry {0} connected on attempt {1} after {2}s." -f $RasEntry, $attempt, $i)
-                return
-            }
-            Start-Sleep -Seconds 1
-        }
-
-        Write-Log (Get-RasFailureHint -RasOutput $lastOutput -RasEntries $KnownRasEntries -RasEntry $RasEntry)
-        if ($attempt -lt $attempts) {
-            Write-Log ("RAS entry {0} not connected; retrying after {1}s." -f $RasEntry, $ConnectRetryDelaySeconds)
+        catch {
+            Write-Log (Get-RasFailureHint -RasOutput $_.Exception.Message -RasEntries $KnownRasEntries -RasEntry $RasEntry)
+            if ($attempt -eq $attempts) { throw }
             Start-Sleep -Seconds ([Math]::Max(1, $ConnectRetryDelaySeconds))
         }
     }
-
-    throw ("RAS entry {0} did not connect after {1} attempt(s). Last hint: {2}" -f $RasEntry, $attempts, (Get-RasFailureHint -RasOutput $lastOutput -RasEntries $KnownRasEntries -RasEntry $RasEntry))
 }
 
 function Get-RasFailureHint {
@@ -429,57 +339,40 @@ function Get-RasFailureHint {
 }
 
 function Add-EnterNrptRules {
-    Invoke-Logged "NRPT before enter" {
-        Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Select-Object Name, Namespace, NameServers, Comment |
-            Format-Table -AutoSize
-    }
-
+    $script:DesiredNrptRules = @()
     foreach ($namespace in $NrptNamespaces) {
-        $existing = Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object { $_.Namespace -contains $namespace -or $_.Namespace -eq $namespace }
-        if ($existing) {
-            throw "NRPT rule already exists for namespace $namespace; refusing to overwrite existing policy."
+        $existing = @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { @($_.Namespace) -contains $namespace })
+        if (@($existing | Where-Object { @($_.NameServers) -notcontains '198.18.0.2' }).Count) {
+            throw "NRPT_CONFLICT: incompatible existing policy for $namespace; preserved."
         }
-
-        $displayName = ("CodexClashEnter-{0}-{1}" -f $Timestamp, ($namespace -replace "[^A-Za-z0-9]", "_"))
-        $rule = Add-DnsClientNrptRule -Namespace $namespace -NameServers "198.18.0.2" -DisplayName $displayName -Comment $NrptComment -PassThru -ErrorAction Stop
-        if ($rule.Name) {
-            $CreatedNrptRuleNames.Add($rule.Name) | Out-Null
+        if ($existing.Count) {
+            foreach ($rule in $existing) { $script:DesiredNrptRules += Get-HitNetNrptRecord -Rule $rule -PreviousRules @($script:PreviousActiveState.NrptRules) }
+            continue
         }
-    }
-
-    Invoke-Logged "NRPT after enter" {
-        Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-            Where-Object { $_.Comment -eq $NrptComment -or $_.Name -in $CreatedNrptRuleNames } |
-            Select-Object Name, Namespace, NameServers, Comment |
-            Format-Table -AutoSize
+        $displayName = 'CodexClashEnter-{0}-{1}' -f $Timestamp,($namespace -replace '[^A-Za-z0-9]','_')
+        $rule = Add-DnsClientNrptRule -Namespace $namespace -NameServers '198.18.0.2' -DisplayName $displayName -Comment $NrptComment -PassThru -ErrorAction Stop
+        if (-not $rule.Name) { throw "New NRPT rule has no identifier: $namespace" }
+        $record = Get-HitNetNrptRecord -Rule $rule -Created
+        $CreatedNrptRuleNames.Add($record.Name)
+        $OperationCreatedNrptRules.Add($record)
+        $script:DesiredNrptRules += $record
+        Save-OperationJournal
     }
 }
 
 function Add-SplitRoute {
-    param(
-        [string]$DestinationPrefix,
-        [int]$InterfaceIndex,
-        [string]$NextHop,
-        [string]$AddressFamily
-    )
-
-    $routeState = [pscustomobject]@{
-        DestinationPrefix = $DestinationPrefix
-        InterfaceIndex = $InterfaceIndex
-        NextHop = $NextHop
-        AddressFamily = $AddressFamily
-    }
-    $existing = Get-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-Log "Split route already exists and will be reused: $DestinationPrefix via $NextHop on ifIndex $InterfaceIndex."
-        $AddedRoutes.Add($routeState) | Out-Null
+    param([string]$DestinationPrefix,[int]$InterfaceIndex,[string]$NextHop,[string]$AddressFamily)
+    $existing = @(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex $InterfaceIndex -ErrorAction Stop | Where-Object { $_.DestinationPrefix -eq $DestinationPrefix -and $_.NextHop -eq $NextHop })
+    if ($existing.Count) {
+        $AddedRoutes.Add((New-HitNetRouteRecord -Route $existing[0] -PreviousRoutes @($script:PreviousActiveState.Routes)))
+        Write-Log "Split route reused: $DestinationPrefix via $NextHop on ifIndex $InterfaceIndex."
         return
     }
-
-    New-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
-    $AddedRoutes.Add($routeState) | Out-Null
+    New-NetRoute -PolicyStore ActiveStore -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
+    $record = New-HitNetRouteRecord -Created -Route ([pscustomobject]@{DestinationPrefix=$DestinationPrefix;InterfaceIndex=$InterfaceIndex;NextHop=$NextHop;AddressFamily=$AddressFamily;RouteMetric=0})
+    $AddedRoutes.Add($record)
+    $OperationCreatedRoutes.Add($record)
+    Save-OperationJournal
 }
 
 function Add-EnterSplitRoutes {
@@ -510,41 +403,32 @@ function Add-EnterSplitRoutes {
 }
 
 function Save-State {
-    param(
-        [AllowNull()][string[]]$NrptRuleNamesOverride = $null,
-        [AllowNull()][object[]]$RoutesOverride = $null,
-        [string]$NrptCommentOverride = "",
-        [string]$TunIpv4GatewayOverride = "",
-        [string]$TunIpv6GatewayOverride = ""
-    )
-
+    param([AllowNull()][string[]]$NrptRuleNamesOverride=$null,[AllowNull()][object[]]$RoutesOverride=$null,[string]$NrptCommentOverride='', [string]$TunIpv4GatewayOverride='', [string]$TunIpv6GatewayOverride='')
     Assert-WorkspacePath -Path $StatePath
-    $nrptNames = if ($null -ne $NrptRuleNamesOverride) {
-        @($NrptRuleNamesOverride)
+    $nrptRecords = @($script:DesiredNrptRules)
+    if ($null -ne $NrptRuleNamesOverride) {
+        $nrptRecords = @(foreach ($rule in @(Get-DnsClientNrptRule -ErrorAction Stop | Where-Object { $_.Name -in $NrptRuleNamesOverride })) {
+            Get-HitNetNrptRecord -Rule $rule -PreviousRules @($script:PreviousActiveState.NrptRules)
+        })
     }
-    else {
-        @($CreatedNrptRuleNames | ForEach-Object { $_ })
-    }
-    $routes = if ($null -ne $RoutesOverride) {
-        @($RoutesOverride)
-    }
-    else {
-        @($AddedRoutes | ForEach-Object { $_ })
-    }
+    $desiredRoutes = if ($null -ne $RoutesOverride) { @($RoutesOverride) } else { @($AddedRoutes.ToArray()) }
+    $createdRoutes = @($OperationCreatedRoutes.ToArray()) + @($ReconcileAddedRoutes.ToArray())
+    $routes = @(Merge-HitNetRouteRecords -ExpectedRoutes $desiredRoutes -PreviousRoutes @($script:PreviousActiveState.Routes) -CreatedRoutes $createdRoutes)
     $state = [pscustomobject]@{
-        Timestamp = $Timestamp
-        RasEntry = $RasEntry
-        LogPath = $LogPath
-        RestoreScript = $RestoreScript
-        NrptComment = if ([string]::IsNullOrWhiteSpace($NrptCommentOverride)) { $NrptComment } else { $NrptCommentOverride }
-        NrptRuleNames = $nrptNames
-        Routes = $routes
-        TunInterfaceAlias = $TunInterfaceAlias
-        TunIpv4Gateway = if ([string]::IsNullOrWhiteSpace($TunIpv4GatewayOverride)) { $TunIpv4Gateway } else { $TunIpv4GatewayOverride }
-        TunIpv6Gateway = if ([string]::IsNullOrWhiteSpace($TunIpv6GatewayOverride)) { $TunIpv6Gateway } else { $TunIpv6GatewayOverride }
-        ProxyUrl = $ProxyUrl
+        SchemaVersion = 2
+        Timestamp = if ($ReconcileOnly -and $script:PreviousActiveState) { [string]$script:PreviousActiveState.Timestamp } else { $Timestamp }
+        RasEntry=$RasEntry; LogPath=$LogPath; RestoreScript=$RestoreScript
+        NrptComment=if ($NrptCommentOverride) { $NrptCommentOverride } else { $NrptComment }
+        NrptRuleNames=@($nrptRecords | ForEach-Object { $_.Name }); NrptRules=$nrptRecords; Routes=$routes
+        TunInterfaceAlias=$TunInterfaceAlias
+        TunIpv4Gateway=if ($TunIpv4GatewayOverride) { $TunIpv4GatewayOverride } else { $TunIpv4Gateway }
+        TunIpv6Gateway=if ($TunIpv6GatewayOverride) { $TunIpv6GatewayOverride } else { $TunIpv6Gateway }
+        ProxyUrl=$ProxyUrl
     }
-    Write-HitNetJsonAtomic -Path $StatePath -InputObject $state -Depth 6
+    Write-HitNetJsonAtomic -Path $StatePath -InputObject $state -Depth 8
+    $script:OperationCommitted = $true
+    $unknown = @($routes | Where-Object { $_.Ownership -eq 'Unknown' }).Count
+    if ($unknown) { Write-Log "LEGACY_ROUTES_RETAINED: $unknown route records have unknown ownership/store; automatic cleanup is disabled for them." }
 }
 
 function Get-ReconcileActiveState {
@@ -591,60 +475,32 @@ function Add-ReconcileNrptRule {
         throw "New project NRPT rule could not be identified for rollback: $Namespace"
     }
     $ReconcileAddedNrptRuleNames.Add($ruleName) | Out-Null
+    $ReconcileAddedNrptRules.Add([pscustomobject]@{Name=$ruleName;Namespace=@($Namespace);NameServers=@('198.18.0.2');Ownership='Created'})
     Write-Log "Reconcile added project NRPT rule for $Namespace."
     return $ruleName
 }
 
 function Add-ReconcileSplitRoute {
     param([Parameter(Mandatory = $true)]$Route)
-
-    $existing = Get-NetRoute -DestinationPrefix $Route.DestinationPrefix -InterfaceIndex ([int]$Route.InterfaceIndex) -NextHop ([string]$Route.NextHop) -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($existing) {
-        Write-Log ("Reconcile found route already present after planning: {0} via {1} on ifIndex {2}." -f $Route.DestinationPrefix, $Route.NextHop, $Route.InterfaceIndex)
-        return
-    }
-
-    New-NetRoute -DestinationPrefix $Route.DestinationPrefix -InterfaceIndex ([int]$Route.InterfaceIndex) -NextHop ([string]$Route.NextHop) -RouteMetric 0 -ErrorAction Stop | Out-Null
-    $ReconcileAddedRoutes.Add([pscustomobject]@{
-        DestinationPrefix = [string]$Route.DestinationPrefix
-        InterfaceIndex = [int]$Route.InterfaceIndex
-        NextHop = [string]$Route.NextHop
-        AddressFamily = [string]$Route.AddressFamily
-    }) | Out-Null
-    Write-Log ("Reconcile added split route: {0} via {1} on ifIndex {2}." -f $Route.DestinationPrefix, $Route.NextHop, $Route.InterfaceIndex)
+    $existing = @(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex ([int]$Route.InterfaceIndex) -ErrorAction Stop | Where-Object { Test-HitNetRouteIdentity $_ $Route })
+    if ($existing.Count) { Write-Log 'Reconcile reused a route created after planning.'; return }
+    New-NetRoute -PolicyStore ActiveStore -DestinationPrefix $Route.DestinationPrefix -InterfaceIndex ([int]$Route.InterfaceIndex) -NextHop $Route.NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
+    $ReconcileAddedRoutes.Add((New-HitNetRouteRecord -Route $Route -Created))
+    Write-Log ("Reconcile added ActiveStore route: {0}." -f $Route.DestinationPrefix)
 }
 
 function Remove-ReconcileRecordedStaleRoute {
     param([Parameter(Mandatory = $true)]$Route)
-
-    $matches = @(Get-NetRoute -DestinationPrefix $Route.DestinationPrefix -InterfaceIndex ([int]$Route.InterfaceIndex) -NextHop ([string]$Route.NextHop) -ErrorAction SilentlyContinue)
-    foreach ($match in $matches) {
-        $match | Remove-NetRoute -Confirm:$false -ErrorAction Stop
-        Write-Log ("Reconcile removed state-recorded stale route: {0} via {1} on ifIndex {2}." -f $Route.DestinationPrefix, $Route.NextHop, $Route.InterfaceIndex)
-    }
+    Remove-HitNetOwnedResources -Routes @($Route)
+    Write-Log ("Reconcile removed an owned stale ActiveStore route: {0}." -f $Route.DestinationPrefix)
 }
 
 function Undo-ReconcileAdditions {
-    foreach ($route in @($ReconcileAddedRoutes | ForEach-Object { $_ })) {
-        try {
-            Get-NetRoute -DestinationPrefix $route.DestinationPrefix -InterfaceIndex ([int]$route.InterfaceIndex) -NextHop ([string]$route.NextHop) -ErrorAction SilentlyContinue |
-                Remove-NetRoute -Confirm:$false -ErrorAction Stop
-            Write-Log ("Reconcile rollback removed newly added route: {0}." -f $route.DestinationPrefix)
-        }
-        catch {
-            Write-Log ("Reconcile rollback warning for route {0}: {1}" -f $route.DestinationPrefix, $_.Exception.Message)
-        }
+    if ($script:OperationCommitted) { return }
+    try {
+        Remove-HitNetOwnedResources -Routes @($ReconcileAddedRoutes.ToArray()) -NrptRules @($ReconcileAddedNrptRules.ToArray())
     }
-    foreach ($ruleName in @($ReconcileAddedNrptRuleNames | ForEach-Object { $_ })) {
-        try {
-            Remove-DnsClientNrptRule -Name $ruleName -Force -ErrorAction Stop
-            Write-Log "Reconcile rollback removed newly added NRPT rule."
-        }
-        catch {
-            Write-Log ("Reconcile rollback warning for NRPT rule: {0}" -f $_.Exception.Message)
-        }
-    }
+    catch { Write-Log ('RECONCILE_ROLLBACK_INCOMPLETE: ' + $_.Exception.Message) }
 }
 
 function Test-ReconcileRoutesReady {
@@ -728,16 +584,15 @@ function Invoke-ReconcileOnly {
     foreach ($route in @($plan.RoutesToAdd)) {
         Add-ReconcileSplitRoute -Route $route
     }
-    foreach ($route in @($plan.RoutesToRemove)) {
-        Remove-ReconcileRecordedStaleRoute -Route $route
-    }
-
     if (-not (Test-NrptRulesReady) -or -not (Test-ReconcileRoutesReady -ExpectedRoutes @($plan.ExpectedRoutes))) {
         throw "Reconcile verification failed after project-owned changes."
     }
-
     $finalRuleNameArray = @($finalNrptRuleNames | ForEach-Object { $_ })
     Save-State -NrptRuleNamesOverride $finalRuleNameArray -RoutesOverride @($plan.ExpectedRoutes) -NrptCommentOverride $NrptComment -TunIpv4GatewayOverride $currentV4Gateway -TunIpv6GatewayOverride $currentV6Gateway
+    # Publish ownership before stale cleanup. A cleanup failure must not roll back the verified working routes.
+    foreach ($route in @($plan.RoutesToRemove)) {
+        Remove-ReconcileRecordedStaleRoute -Route $route
+    }
     Write-Log ("RECONCILE_REPAIRED: nrpt_added={0} routes_added={1} stale_recorded_routes_removed={2}; no dialing or process restart was attempted." -f $plan.NrptNamespacesToAdd.Count, $plan.RoutesToAdd.Count, $plan.RoutesToRemove.Count)
 }
 
@@ -873,9 +728,12 @@ function Test-EnterConnectivity {
 }
 
 function Restore-OnFailure {
-    if (Test-Path -LiteralPath $RestoreScript) {
-        & $RestoreScript -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway -SkipProbe -Reason "enter failure rollback" 2>&1 | Tee-Object -FilePath $LogPath -Append
-    }
+    if ($script:OperationCommitted) { Write-Log 'Committed connection retained; no rollback after state publication.'; return }
+    try { Remove-HitNetOwnedResources -Routes @($OperationCreatedRoutes.ToArray()) -NrptRules @($OperationCreatedNrptRules.ToArray()) }
+    catch { Write-Log ('ROLLBACK_INCOMPLETE: ' + $_.Exception.Message) }
+    try { Undo-HitNetRasDial -DialResult $script:OperationDial }
+    catch { Write-Log ('ROLLBACK_INCOMPLETE: ' + $_.Exception.Message) }
+    Write-Log 'Bounded rollback finished; pre-existing connections and resources were retained.'
 }
 
 Write-Log ("LogPath={0}" -f $LogPath)
@@ -901,6 +759,7 @@ if (-not (Acquire-EnterLock)) {
 }
 
 try {
+    $script:PreviousActiveState = Get-ReconcileActiveState
     if ($ReconcileOnly) {
         Invoke-ReconcileOnly
         return
@@ -913,10 +772,9 @@ try {
     if (Test-EnterReady) {
         Write-Log "FAST_PATH_ALREADY_READY: HITnet, Clash, TUN, NRPT, and split routes are already ready."
         Test-EnterConnectivity -AssumeLocalReady
-        if (-not (Test-Path -LiteralPath $StatePath)) {
-            Capture-ExistingEnterState
-            Save-State
-        }
+        PreRestore
+        Capture-ExistingEnterState
+        Save-State
         New-Item -Path $DonePath -ItemType File -Force | Out-Null
         $Entered = $true
         Write-Log ("ENTER_PPPOE_CODEX_OK. Restore with: {0} -RasEntry {1}" -f $RestoreScript, $RasEntry)

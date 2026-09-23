@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$RasEntry,
     [string]$Username,
     [pscredential]$Credential,
@@ -51,11 +51,7 @@ function Invoke-Logged {
     Invoke-HitNetLogged -LogPath $LogPath -Title $Title -Script $Script
 }
 
-function Get-PlainPasswordFromCredential {
-    param([pscredential]$Cred)
 
-    return (Get-HitNetPlainPasswordFromCredential -Credential $Cred)
-}
 
 function Read-NonEmptyValue {
     param(
@@ -134,31 +130,24 @@ function Get-ExistingClashRouteSummary {
 
 function Connect-RasOnly {
     param([pscredential]$Cred)
-
-    $plainPassword = Get-PlainPasswordFromCredential -Cred $Cred
-    try {
-        for ($attempt = 1; $attempt -le $ConnectAttempts; $attempt++) {
-            Write-Log ("Dial PPPoE only attempt {0}/{1}: {2}" -f $attempt, $ConnectAttempts, $RasEntry)
-            $output = (& rasdial.exe $RasEntry $Cred.UserName $plainPassword 2>&1 | Out-String -Width 4096).TrimEnd()
-            if (-not [string]::IsNullOrWhiteSpace($output)) {
-                $output | Tee-Object -FilePath $LogPath -Append
-            }
-
-            if (Test-RasConnected -EntryName $RasEntry) {
-                return
-            }
-
-            if ($attempt -lt $ConnectAttempts) {
-                Start-Sleep -Seconds $ConnectRetryDelaySeconds
-            }
+    $attempts = [Math]::Max(1, $ConnectAttempts)
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            $null = Invoke-HitNetRasDial -RasEntry $RasEntry -Credential $Cred
+            Write-Log ("PPPoE ready on attempt {0}: {1}" -f $attempt, $RasEntry)
+            return
         }
-        throw "PPPoE dial did not connect: $RasEntry"
-    }
-    finally {
-        $plainPassword = $null
+        catch {
+            Write-Log $_.Exception.Message
+            if ($attempt -eq $attempts) { throw }
+            Start-Sleep -Seconds ([Math]::Max(1, $ConnectRetryDelaySeconds))
+        }
     }
 }
 
+$operationLock = New-HitNetNamedMutexState -Name 'Local\HitCampusPppoeClashEnter'
+try {
+if (-not (Acquire-HitNetNamedMutex -State $operationLock -WaitSeconds 3)) { throw 'PPPOE_ONLY_BUSY: another connection operation is active.' }
 Write-Log "PPPOE_ONLY_START"
 Write-Log "Mode: dial PPPoE only. This script does not start Clash, stop Clash, change DNS, change MTU, add NRPT, add routes, or remove routes."
 Write-Log ("RasEntry: {0}" -f $RasEntry)
@@ -194,3 +183,5 @@ if (-not (Test-RasConnected -EntryName $RasEntry)) {
 
 "PPPOE_ONLY_DONE {0}" -f (Get-Date -Format "s") | Set-Content -LiteralPath $DonePath -Encoding UTF8
 Write-Log "PPPOE_ONLY_OK"
+
+} finally { Release-HitNetNamedMutex -State $operationLock }

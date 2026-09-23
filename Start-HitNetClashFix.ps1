@@ -199,7 +199,7 @@ function Save-AppSettings {
         }
     }
 
-    [pscustomobject]$settings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
+    Write-HitNetJsonAtomic -Path $SettingsPath -InputObject ([pscustomobject]$settings) -Depth 5
 }
 
 function Get-UiConfig {

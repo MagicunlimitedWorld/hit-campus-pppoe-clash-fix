@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$IncludeBusyLockCheck
 )
 
@@ -173,10 +173,10 @@ function Invoke-NativeCapture {
 function Invoke-ReconcilePlannerChecks {
     $namespaces = @(".openai.com", ".chatgpt.com")
     $expectedRoutes = @(
-        [pscustomobject]@{ DestinationPrefix = "0.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4" },
-        [pscustomobject]@{ DestinationPrefix = "128.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4" },
-        [pscustomobject]@{ DestinationPrefix = "::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6" },
-        [pscustomobject]@{ DestinationPrefix = "8000::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6" }
+        [pscustomobject]@{ DestinationPrefix = "0.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4"; Ownership = "Created"; PolicyStore = "ActiveStore"; RouteMetric = 0 },
+        [pscustomobject]@{ DestinationPrefix = "128.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4"; Ownership = "Created"; PolicyStore = "ActiveStore"; RouteMetric = 0 },
+        [pscustomobject]@{ DestinationPrefix = "::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6"; Ownership = "Created"; PolicyStore = "ActiveStore"; RouteMetric = 0 },
+        [pscustomobject]@{ DestinationPrefix = "8000::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6"; Ownership = "Created"; PolicyStore = "ActiveStore"; RouteMetric = 0 }
     )
     $rules = @(
         [pscustomobject]@{ Name = "rule-openai"; Namespace = @(".openai.com"); NameServers = @("198.18.0.2"); Comment = "CodexClashEnter test"; DisplayName = "CodexClashEnter-openai" },
@@ -323,6 +323,10 @@ try {
 
     Invoke-Check -Name "connection guard mocked recovery" -Script {
         Invoke-ExternalPowerShell -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "Test-HitNetClashGuard.ps1")) -RequiredToken "HITNET_GUARD_TEST_OK"
+    }
+
+    Invoke-Check -Name "ownership, rollback, credentials and persisted intent" -Script {
+        Invoke-ExternalPowerShell -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "Test-HitNetClashStability.ps1")) -RequiredToken "HITNET_STABILITY_TEST_OK"
     }
 
     Invoke-Check -Name "CLI compatibility" -Script {

@@ -1,81 +1,5 @@
-function Initialize-HitNetGuardNative {
-    if ('HitNet.GuardRas' -as [type]) { return }
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Security;
-namespace HitNet {
-    public static class GuardRas {
-        // ras.h uses pack(4), including the Windows 8+ encrypted-password pointer.
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
-        public struct DialParameters {
-            public uint Size;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)] public string Entry;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 129)] public string Phone;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 129)] public string Callback;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)] public string User;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 257, ArraySubType = UnmanagedType.U2)] public char[] Password;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)] public string Domain;
-            public uint SubEntry;
-            public UIntPtr CallbackId;
-            public uint IfIndex;
-            public IntPtr EncryptedPassword;
-        }
-        [DllImport("rasapi32.dll", CharSet = CharSet.Unicode)]
-        private static extern uint RasDialW(IntPtr extensions, string book, ref DialParameters parameters,
-            uint notifierType, IntPtr notifier, out IntPtr connection);
-        [DllImport("rasapi32.dll", CharSet = CharSet.Unicode)]
-        private static extern uint RasGetEntryDialParamsW(string book, ref DialParameters parameters,
-            [MarshalAs(UnmanagedType.Bool)] out bool hasPassword);
-        [DllImport("rasapi32.dll")]
-        private static extern uint RasHangUpW(IntPtr connection);
-        private static DialParameters Create(string entry) {
-            var p = new DialParameters();
-            p.Size = (uint)Marshal.SizeOf(typeof(DialParameters));
-            p.Entry = entry; p.Phone = ""; p.Callback = ""; p.User = ""; p.Domain = "";
-            p.Password = new char[257];
-            return p;
-        }
-        public static uint ValidatePhonebook(string book, string entry) {
-            var p = Create(entry);
-            try { bool hasPassword; return RasGetEntryDialParamsW(book, ref p, out hasPassword); }
-            finally { if (p.Password != null) Array.Clear(p.Password, 0, p.Password.Length); }
-        }
-        public static uint Dial(string book, string entry, string user, SecureString password) {
-            if (entry.Length > 256 || user.Length > 256 || password.Length > 256)
-                throw new ArgumentException("RAS field length exceeded.");
-            var p = Create(entry); p.User = user;
-            IntPtr plain = Marshal.SecureStringToGlobalAllocUnicode(password);
-            IntPtr connection = IntPtr.Zero;
-            try {
-                for (int i = 0; i < password.Length; i++) p.Password[i] = (char)Marshal.ReadInt16(plain, i * 2);
-                uint error = RasDialW(IntPtr.Zero, book, ref p, 0, IntPtr.Zero, out connection);
-                // Only release a failed dial's own reference; never hang up a successful session.
-                if (error != 0 && connection != IntPtr.Zero) RasHangUpW(connection);
-                return error;
-            }
-            finally {
-                Marshal.ZeroFreeGlobalAllocUnicode(plain);
-                Array.Clear(p.Password, 0, p.Password.Length);
-            }
-        }
-    }
-}
-'@
-}
-
-function Get-HitNetGuardPhonebook {
-    param([string]$RasEntry)
-    $paths = @(
-        (Join-Path $env:APPDATA 'Microsoft\Network\Connections\Pbk\rasphone.pbk'),
-        (Join-Path $env:ProgramData 'Microsoft\Network\Connections\Pbk\rasphone.pbk')
-    )
-    $found = @(foreach ($path in $paths) {
-        if (Test-HitNetRasEntryExists -RasEntries @(Get-HitNetRasEntries -RasPhonePaths @($path)) -RasEntry $RasEntry) { $path }
-    })
-    if ($found.Count -ne 1) { throw 'GUARD_PHONEBOOK_AMBIGUOUS_OR_MISSING: expected one matching phonebook.' }
-    return $found[0]
-}
+﻿function Initialize-HitNetGuardNative { Initialize-HitNetRasNative }
+function Get-HitNetGuardPhonebook { param([string]$RasEntry) Get-HitNetRasPhonebook -RasEntry $RasEntry }
 
 function Get-HitNetGuardCredential {
     param([string]$SettingsPath)
@@ -116,8 +40,8 @@ function Get-HitNetGuardSnapshot {
     if ($LASTEXITCODE -ne 0) { throw 'GUARD_RAS_STATUS_UNAVAILABLE: no recovery was attempted.' }
     $connected = @($status | Where-Object { $_.ToString().Trim() -eq $Config.RasEntry }).Count -gt 0
     $disconnect = if (-not $connected) { Get-HitNetGuardDisconnect -RasEntry $Config.RasEntry } else { $null }
-    $manual = $false
-    if ($active -and $disconnect -and $disconnect.Code -in @(631, 830)) {
+    $manual = [bool]$active.PausedByUser
+    if (-not $manual -and $active -and $disconnect -and $disconnect.Code -in @(631, 830)) {
         $started = [datetime]::MinValue
         if ([datetime]::TryParseExact([string]$active.Timestamp, 'yyyyMMdd_HHmmss_fff',
                 [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal, [ref]$started)) {
@@ -152,7 +76,8 @@ function Get-HitNetGuardDecision {
     param($Snapshot, $Previous, [datetime]$NowUtc = [datetime]::UtcNow)
     $NowUtc = $NowUtc.ToUniversalTime()
     if (-not $Snapshot.Active) { return 'INACTIVE' }
-    if ($Snapshot.ManualDisconnect) { return 'MANUAL_DISCONNECT' }
+    if ($Snapshot.ManualDisconnect -or ($Previous -and $Previous.Epoch -eq $Snapshot.Epoch -and
+            ($Previous.PausedByUser -or $Previous.Code -eq 'GUARD_MANUAL_DISCONNECT'))) { return 'MANUAL_DISCONNECT' }
     if (-not $Snapshot.RasConnected) {
         if (-not $Snapshot.EthernetReady) { return 'LINK_DOWN' }
         if (-not $Previous -or $Previous.Epoch -ne $Snapshot.Epoch -or $Previous.RasConnected -or -not $Previous.CheckedAtUtc) { return 'CONFIRM_DISCONNECT' }
@@ -167,11 +92,9 @@ function Get-HitNetGuardDecision {
 
 function Invoke-HitNetGuardDial {
     param($Config)
-    $book = Get-HitNetGuardPhonebook -RasEntry $Config.RasEntry
     $credential = Get-HitNetGuardCredential -SettingsPath $Config.SettingsPath
-    Initialize-HitNetGuardNative
-    $errorCode = [HitNet.GuardRas]::Dial($book, $Config.RasEntry, $credential.UserName, $credential.Password)
-    if ($errorCode -ne 0) { throw ('GUARD_DIAL_FAILED: RAS error {0}.' -f $errorCode) }
+    try { $null = Invoke-HitNetRasDial -RasEntry $Config.RasEntry -Credential $credential }
+    finally { if ($credential) { $credential.Password.Dispose() } }
 }
 
 function Start-HitNetGuardRayLink {
@@ -215,9 +138,11 @@ function Invoke-HitNetGuardCycle {
     $state = [ordered]@{
         CheckedAtUtc = $NowUtc.ToString('o'); Epoch = $snapshot.Epoch; RasConnected = $snapshot.RasConnected
         NextDialUtc = $null; DialFailures = 0; NextServiceStartUtc = $null
+        PausedByUser = ($decision -eq 'MANUAL_DISCONNECT')
         Code = "GUARD_$decision"; Actions = @(); Disconnect = $snapshot.Disconnect; Probe = $null
     }
     if ($previous -and $previous.Epoch -eq $snapshot.Epoch) {
+        $state.PausedByUser = $state.PausedByUser -or $previous.PausedByUser -or $previous.Code -eq 'GUARD_MANUAL_DISCONNECT'
         $state.NextDialUtc = $previous.NextDialUtc
         $state.DialFailures = [int]$previous.DialFailures
         $state.NextServiceStartUtc = $previous.NextServiceStartUtc
@@ -233,7 +158,10 @@ function Invoke-HitNetGuardCycle {
             else {
                 # Re-read intent and connectivity under the same lock used by enter/restore.
                 $snapshot = Get-HitNetGuardSnapshot -Config $config -ScriptDir $ScriptDir
-                if (-not $snapshot.Active -or $snapshot.ManualDisconnect -or $snapshot.Epoch -ne $state.Epoch) { $state.Code = 'GUARD_INTENT_CHANGED'; $exitCode = 0 }
+                if (-not $snapshot.Active -or $snapshot.ManualDisconnect -or $snapshot.Epoch -ne $state.Epoch) {
+                    $state.PausedByUser = [bool]$snapshot.ManualDisconnect
+                    $state.Code = 'GUARD_INTENT_CHANGED'; $exitCode = 0
+                }
                 else {
                     if ($decision -eq 'DIAL' -and -not $snapshot.RasConnected -and $snapshot.EthernetReady) {
                         $state.DialFailures++

@@ -46,7 +46,7 @@ Start-HitNetClashFix.cmd
 2. 勾选“登录自连 + 15分钟网络检查”。
 3. UI 统一管理两个当前用户、最高权限的计划任务：原有登录自动连接，以及每 15 分钟运行一次的恢复任务。保留原有 `HitCampusPppoeClashHealthCheck` 任务名，动作更新为 `guard_pppoe_clash.ps1`。
 4. 项目活动状态存在且有线链路在线时，连续两个 15 分钟周期均观察到意外 PPPoE 掉线才允许重拨；同一活动会话的两次观察间隔须在 12–20 分钟内（含边界），超过 20 分钟则重新确认。首次重拨通常等待 15–30 分钟。拨号失败和本守护的服务启动重试均冷却 15 分钟，每轮只尝试一次，任务最长运行 3 分钟；不在轮次之间短暂复查。
-5. “切回 WLAN”清除活动状态后停止自动恢复；检测到本次活动开始后的 RAS 631（用户断开）或 830（注销）也暂停重拨。直接关闭 TUN 或系统代理不会触发强制重启 Clash。
+5. “切回 WLAN”先保存暂停意图，确认本地清理成功后才清除活动状态；清理失败保留状态以便重试。RAS 631（用户断开）或 830（注销）也持久暂停重拨，事件超过三天后仍保持暂停。再次点击“修复 PPPoE + Clash”成功后恢复守护，已连接的快速路径同样生效。直接关闭 TUN 或系统代理不会触发强制重启 Clash。
 6. RayLink 已安装、未禁用且服务停止时，恢复任务只启动该服务，不重启正在运行的服务。安装器可另行配置 Windows 服务失败恢复。
 
 下方输出框会显示状态、预检结果、拨号过程和恢复过程。默认成功后窗口保持打开；需要自动退出时可勾选“成功后自动关闭”。“刷新状态”和“复制脱敏诊断”都是只读操作，不会拨号、删路由或修改 Clash。
@@ -90,9 +90,12 @@ Start-HitNetClashFix.cmd
 - `connect_pppoe_only.ps1`：仅 PPPoE 拨号，不启动或修改 Clash。
 - `auto_connect_pppoe_clash.ps1`：登录自动连接与低频健康检查入口。
 - `guard_pppoe_clash.ps1`：每 15 分钟网络检查入口；`-ObserveOnly` 只读查看恢复条件。
-- `HitNetClashGuard.ps1`：恢复决策、原生 RAS 拨号、服务检查和计划任务注册。
+- `HitNetClashGuard.ps1`：恢复决策、共享 RAS 调用、服务检查和计划任务注册。
+- `HitNetClashResources.ps1`：路由与 NRPT 归属记录、精确清理和结果验证。
+- `Watch-HitNetOperation.ps1`：连接超时后，仅依据本次操作日志清理新增资源，保留 RAS 连接。
 - `Install-HitNetClashGuard.ps1`：升级现有周期任务，并配置 RayLink 服务失败后延迟重启；不拨号或重启当前服务。
 - `Test-HitNetClashGuard.ps1`：使用模拟网络和服务验证恢复及不干扰健康连接的行为。
+- `Test-HitNetClashStability.ps1`：不依赖校园网的归属、回滚、凭据、暂停及配置损坏模拟测试。
 - `restore_wlan_clash.ps1`：恢复 WLAN + Clash。
 - `diagnostics/pppoe_clash_test_and_restore.ps1`：诊断和受控测试脚本。
 
@@ -101,7 +104,7 @@ Start-HitNetClashFix.cmd
 - 默认不保存账号和密码。
 - “记住账号”会保存到 `.local/settings.json`。
 - “记住密码”使用 Windows DPAPI 加密，只能由当前 Windows 用户解密。
-- “登录自连 + 15分钟网络检查”使用两个 Windows 计划任务触发。守护任务仅在确认需要重拨时解密保存的凭据，通过 Windows RAS API 传入进程内数据，不把密码放入子进程命令行。
+- “登录自连 + 15分钟网络检查”使用两个 Windows 计划任务触发。手动连接、仅拨号、登录自连和守护重拨统一使用 Windows RAS API，不把密码放入子进程命令行。守护仅在确认需要重拨时解密保存的凭据。
 - 日志、done marker、状态文件都放在 `.runtime/` 下。
 - `.local/` 和 `.runtime/` 已加入 `.gitignore`，不会上传 GitHub。
 
@@ -190,11 +193,11 @@ RayLink 连续超时时先检查 `.runtime/state/connection_guard.json`：
 - RAS `629`：通常是校园侧终止 PPPoE 认证/注册。等待 1-2 分钟后重试，若持续出现，请检查账号权限、在线会话限制、墙口/交换机端口、VLAN 或 PPPoE 服务状态。
 - RAS `828`：[Microsoft 定义为连接空闲超时](https://learn.microsoft.com/en-us/windows/win32/rras/routing-and-remote-access-error-codes)。记录断开事件、电话簿当时的空闲策略及校园侧会话记录后再判断来源；不能仅凭这个码归因于 Clash 或网线。守护会记录最近的 RAS 原因码、时间和事件记录号，并对非主动断线进行有界重连。
 - Office 登录失败（例如 Microsoft Store / Word 等）：本项目不改 Office 登录策略。若在开启系统代理时登录受阻，可先关闭系统代理测试；如果可恢复，说明是代理策略对该应用的影响，后续可采用按需重试或临时关闭系统代理。
-- 无法恢复：运行 `restore_wlan_clash.ps1`。脚本只清理本项目创建的临时 NRPT 和 split route。
+- 无法恢复：运行 `restore_wlan_clash.ps1`。脚本只清理有明确归属且内容仍匹配的 NRPT 和 ActiveStore split route。复用和旧版来源不明的路由保留并报告；本地清理未完成时返回失败，不显示“已切换回 WLAN”。
 
 ## 安全说明
 
-- 新守护的重拨使用 RAS API，不把密码写入子进程命令行参数。
+- 所有拨号入口共用原生 RAS API，不把密码写入子进程命令行参数。
 - 不关闭 WLAN。
 - 不修改 Clash 配置。
 - 不自动开启 Clash TUN。
@@ -206,6 +209,16 @@ RayLink 连续超时时先检查 `.runtime/state/connection_guard.json`：
 - 不上传日志、运行状态、Clash 配置备份、`.runtime/` 或 `.local/` 本地凭据。
 
 ## 项目维护
+
+### 稳定性版本 v0.2.0
+
+- 新建 split route 显式使用 `ActiveStore`；活动状态版本为 `SchemaVersion=2`，记录 `Created`、`Reused` 或 `Unknown` 归属及存储位置。
+- 旧版本没有记录路由来源，而且可能写入了 `PersistentStore`。升级不会自动认领或删除这些路由；旧记录按 `Unknown` 保留，核实前不要清空路由表。
+- 普通连接不再预先删除已有路由或规则。失败时只撤销本次新增项，只释放本次拨号取得的 RAS 句柄；已有 PPPoE 保持连接。成功提交活动状态后，不因日志或旧路由清理失败而撤销已验证的工作路由。
+- 活动状态与设置均采用原子 JSON 写入。已有 JSON 损坏时明确报错，不静默替换为默认配置。命令行参数与原有 DPAPI 凭据格式保持兼容。
+- 成功的手动连接更新活动会话时间；定期路由协调保留原时间，不重置用户暂停意图。仅拨号模式不启用 Clash 守护。
+- 超时看门狗只处理本次操作日志记录的新增路由和规则。操作仍持锁或已有同次/更新的成功状态时不修改网络；进程异常退出后也不按连接名称强制断开 PPPoE。
+- GitHub Actions 使用 Windows PowerShell 5.1，运行解析与模拟测试，不需要真实账号、Clash 或校园网。完整本机自检仍使用下方原入口。
 
 - `HitNetClashRuntime.ps1`：共享运行时 helper，集中日志、RAS、端口、TUN、NRPT、split route、OpenAI probe 和 mutex 工具函数。
 - `Test-HitNetClashProject.ps1`：发布前自检入口，覆盖 PowerShell parser、CLI/UI 兼容性、模拟协调计划、原子状态替换、auto-connect ValidateOnly、`config.example.json`、`git diff --check` 和敏感信息扫描。

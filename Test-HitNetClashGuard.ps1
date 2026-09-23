@@ -192,6 +192,21 @@ try {
     Assert-Guard (($calls.Dial + $calls.Start + $calls.Reconcile) -eq 0) 'HTTP failure reset a healthy local network.'
     Assert-Guard ($calls.Probe -eq 1) 'HTTP failure caused an extra probe pair.'
 
+    Reset-Fixture
+    $fixture.RasConnected = $false; $fixture.ManualDisconnect = $true
+    $null = Invoke-Cycle
+    $fixture.ManualDisconnect = $false
+    $result = Invoke-Cycle (4 * 86400)
+    Assert-Guard ($result.State.PausedByUser -and $calls.Dial -eq 0) 'Manual intent expired with the RAS event window.'
+    $fixture.Active = $false
+    $null = Invoke-Cycle (4 * 86400 + 900)
+    $fixture.Active = $true
+    $result = Invoke-Cycle (4 * 86400 + 1800)
+    Assert-Guard ($result.Code -eq 'GUARD_MANUAL_DISCONNECT' -and $calls.Dial -eq 0) 'An inactive round erased a pause in the same epoch.'
+    $fixture.Epoch = 'explicit-reconnect'
+    $result = Invoke-Cycle (4 * 86400 + 2700)
+    Assert-Guard ($result.Code -eq 'GUARD_CONFIRM_DISCONNECT' -and -not $result.State.PausedByUser) 'Explicit reconnect did not clear the old pause.'
+
     $beforeRegistration = Get-Date
     Register-HitNetGuardTask -ScriptDir $PSScriptRoot -SettingsPath fixture
     $afterRegistration = Get-Date
