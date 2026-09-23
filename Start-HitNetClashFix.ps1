@@ -17,7 +17,10 @@ $RestoreScript = Join-Path $ScriptDir "restore_wlan_clash.ps1"
 $AutoConnectScript = Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"
 $ConfigScript = Join-Path $ScriptDir "HitNetClashConfig.ps1"
 $RuntimeScript = Join-Path $ScriptDir "HitNetClashRuntime.ps1"
+$GuardScript = Join-Path $ScriptDir "guard_pppoe_clash.ps1"
 $AutoConnectTaskName = "HitCampusPppoeClashAutoConnect"
+$HealthCheckTaskName = "HitCampusPppoeClashHealthCheck"
+$HealthCheckIntervalMinutes = 15
 $RuntimeDir = Join-Path $ScriptDir ".runtime"
 $RuntimeLogDir = Join-Path $RuntimeDir "logs"
 $RuntimeMarkerDir = Join-Path $RuntimeDir "markers"
@@ -35,6 +38,7 @@ if (-not (Test-Path -LiteralPath $RuntimeScript)) {
 }
 . $ConfigScript
 . $RuntimeScript
+. (Join-Path $ScriptDir "HitNetClashGuard.ps1")
 $script:CurrentConfig = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath -RasEntry $RasEntry -ProxyUrl $ProxyUrl -TunInterfaceAlias $TunInterfaceAlias -ClashPath $ClashPath
 
 $script:RasEntryBox = $null
@@ -45,7 +49,7 @@ $script:StateSummaryCache = [pscustomobject]@{
     Text = "状态读取中..."
     ExpiresAt = [datetime]::MinValue
     AutoConnectEnabled = $null
-    AutoConnectStatusText = "登录后自动连接: 未检查"
+    AutoConnectStatusText = "登录自动连接与 15 分钟网络检查: 未检查"
 }
 $script:StateSummaryTtlSeconds = 10
 
@@ -195,7 +199,7 @@ function Save-AppSettings {
         }
     }
 
-    [pscustomobject]$settings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
+    Write-HitNetJsonAtomic -Path $SettingsPath -InputObject ([pscustomobject]$settings) -Depth 5
 }
 
 function Get-UiConfig {
@@ -242,13 +246,33 @@ function Get-AutoConnectTask {
     }
 }
 
+function Get-HealthCheckTask {
+    try {
+        return Get-ScheduledTask -TaskName $HealthCheckTaskName -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-AutoConnectTaskActionArguments {
     param([string]$SettingsPathValue = $SettingsPath)
     return '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -SettingsPath {1}' -f (Quote-Arg $AutoConnectScript), (Quote-Arg $SettingsPathValue)
 }
 
+function Get-HealthCheckTaskActionArguments {
+    param([string]$SettingsPathValue = $SettingsPath)
+    return '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -SettingsPath {1}' -f (Quote-Arg $GuardScript), (Quote-Arg $SettingsPathValue)
+}
+
+function New-HealthCheckTaskTrigger {
+    return (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($HealthCheckIntervalMinutes) -RepetitionInterval (New-TimeSpan -Minutes $HealthCheckIntervalMinutes))
+}
+
 function Get-AutoConnectTaskStatusText {
-    return (Get-HitNetScheduledTaskSnapshot -TaskName $AutoConnectTaskName).Text
+    $auto = Get-HitNetScheduledTaskSnapshot -TaskName $AutoConnectTaskName -DisplayLabel "登录自动连接"
+    $health = Get-HitNetScheduledTaskSnapshot -TaskName $HealthCheckTaskName -DisplayLabel "15 分钟网络检查"
+    return ("{0}{1}{2}" -f $auto.Text, [Environment]::NewLine, $health.Text)
 }
 
 function Register-AutoConnectTask {
@@ -257,23 +281,26 @@ function Register-AutoConnectTask {
     }
 
     $powershellExe = Join-Path $PSHOME "powershell.exe"
-    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument (Get-AutoConnectTaskActionArguments)
+    $autoAction = New-ScheduledTaskAction -Execute $powershellExe -Argument (Get-AutoConnectTaskActionArguments)
     $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    $autoTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
     try {
-        $trigger.Delay = "PT30S"
+        $autoTrigger.Delay = "PT30S"
     }
     catch {
     }
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
     $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName $AutoConnectTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description "Logon auto-connect for HIT PPPoE plus Clash." -Force | Out-Null
+    Register-ScheduledTask -TaskName $AutoConnectTaskName -Action $autoAction -Trigger $autoTrigger -Principal $principal -Settings $taskSettings -Description "Logon auto-connect for HIT PPPoE plus Clash." -Force | Out-Null
+    Register-HitNetGuardTask -ScriptDir $ScriptDir -SettingsPath $SettingsPath
 }
 
 function Unregister-AutoConnectTask {
-    $task = Get-AutoConnectTask
-    if ($task) {
+    if (Get-AutoConnectTask) {
         Unregister-ScheduledTask -TaskName $AutoConnectTaskName -Confirm:$false
+    }
+    if (Get-HealthCheckTask) {
+        Unregister-ScheduledTask -TaskName $HealthCheckTaskName -Confirm:$false
     }
 }
 
@@ -315,17 +342,10 @@ function Get-DetailedStatusText {
     $proxyListening = Test-ClashPort -Url $cfg.ProxyUrl
     $tunAdapter = Get-NetAdapter -Name $cfg.TunInterfaceAlias -ErrorAction SilentlyContinue | Select-Object -First 1
     $stateExists = Test-Path -LiteralPath $StatePath
-    $task = Get-AutoConnectTask
-    $taskText = "登录后自动连接: 未启用"
-    if ($task) {
-        try {
-            $taskInfo = Get-ScheduledTaskInfo -TaskName $AutoConnectTaskName -ErrorAction Stop
-            $taskText = "登录后自动连接: 已启用 State=$($task.State) LastRun=$($taskInfo.LastRunTime) LastResult=$($taskInfo.LastTaskResult)"
-        }
-        catch {
-            $taskText = "登录后自动连接: 已启用 State=$($task.State)"
-        }
-    }
+    $autoTask = Get-AutoConnectTask
+    $healthTask = Get-HealthCheckTask
+    $automationEnabled = [bool]($autoTask -and $healthTask)
+    $taskText = Get-AutoConnectTaskStatusText
 
     $tunPattern = [regex]::Escape($cfg.TunInterfaceAlias)
     $adapterObjects = @(Get-NetAdapter -ErrorAction SilentlyContinue)
@@ -337,14 +357,18 @@ function Get-DetailedStatusText {
             $_.InterfaceDescription -notmatch "Wireless|Wi-?Fi|Meta|Clash|TUN|Loopback|Bluetooth|Virtual"
         } |
         Select-Object -First 1)
-    $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+    $rasEntries = Get-HitNetRasEntries
+    $rasEntriesSummary = Get-HitNetRasEntriesSummary -RasEntries $rasEntries
+    $rasEntryExists = Test-HitNetRasEntryExists -RasEntries $rasEntries -RasEntry $cfg.RasEntry
+    $summary = "{0}({1}): {2}    Clash: {3}    TUN: {4}    有线: {5}    状态文件: {6}    自启: {7}" -f `
         $cfg.RasEntry,
+        $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }),
         $(if ($ras -match [regex]::Escape($cfg.RasEntry)) { "已连接" } else { "未连接" }),
         $(if ($proxyListening) { "已监听" } else { "未监听" }),
         $(if ($tunAdapter -and $tunAdapter.Status -eq "Up") { "已就绪" } else { "未就绪" }),
         $(if ($ethernetReady) { "已连接" } else { "未就绪" }),
         $(if ($stateExists) { "存在" } else { "无" }),
-        $(if ($task) { "已启用" } else { "未启用" })
+        $(if ($automationEnabled) { "已启用" } elseif ($autoTask -or $healthTask) { "部分启用" } else { "未启用" })
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(("=== {0} {1} ===" -f $Label, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))) | Out-Null
@@ -352,6 +376,8 @@ function Get-DetailedStatusText {
     $lines.Add(("PPPoE: {0}" -f $cfg.RasEntry)) | Out-Null
     $lines.Add(("Proxy: {0}" -f $cfg.ProxyUrl)) | Out-Null
     $lines.Add(("TUN: {0}" -f $cfg.TunInterfaceAlias)) | Out-Null
+    $lines.Add(("PPPoE项检测: {0} ({1})" -f $cfg.RasEntry, $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }))) | Out-Null
+    $lines.Add(("PPPoE项清单: {0}" -f $rasEntriesSummary)) | Out-Null
     $lines.Add(("ClashPath: {0}" -f $cfg.ClashPath)) | Out-Null
     $lines.Add(("状态文件路径: {0}" -f $StatePath)) | Out-Null
     $lines.Add($taskText) | Out-Null
@@ -386,19 +412,21 @@ function Get-DetailedStatusText {
     $lines.Add("--- Codex NRPT ---") | Out-Null
     $lines.Add($(if ([string]::IsNullOrWhiteSpace($nrpt)) { "(none)" } else { $nrpt.Trim() })) | Out-Null
 
-    $routes = Get-NetRoute -DestinationPrefix "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
+    $routes = Get-HitNetRoutesByPrefix -DestinationPrefix @("0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1") |
         Select-Object DestinationPrefix, NextHop, InterfaceAlias, RouteMetric, InterfaceMetric, AddressFamily |
         Out-String -Width 4096
     $lines.Add("--- Codex split routes ---") | Out-Null
     $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
 
-    $lines.Add("--- logon auto-connect task ---") | Out-Null
-    if ($task) {
-        $taskActions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
-        $lines.Add($taskActions) | Out-Null
-    }
-    else {
-        $lines.Add("(not registered)") | Out-Null
+    $lines.Add("--- logon auto-connect and 15-minute network-check tasks ---") | Out-Null
+    foreach ($task in @($autoTask, $healthTask)) {
+        if ($task) {
+            $taskActions = @($task.Actions | ForEach-Object { "{0} {1}" -f $_.Execute, $_.Arguments }) -join [Environment]::NewLine
+            $lines.Add($taskActions) | Out-Null
+        }
+        else {
+            $lines.Add("(not registered)") | Out-Null
+        }
     }
     return ($lines -join [Environment]::NewLine)
 }
@@ -435,6 +463,14 @@ function Invoke-SelfTest {
     $taskArgs = Get-AutoConnectTaskActionArguments -SettingsPathValue $testPath
     if ($taskArgs -notmatch "auto_connect_pppoe_clash\.ps1" -or $taskArgs -notmatch [regex]::Escape($testPath) -or $taskArgs -match "selftest-password") {
         throw "SelfTest auto-connect task command failed."
+    }
+    $healthTaskArgs = Get-HealthCheckTaskActionArguments -SettingsPathValue $testPath
+    if ($healthTaskArgs -notmatch "guard_pppoe_clash\.ps1" -or $healthTaskArgs -notmatch "-NonInteractive" -or $healthTaskArgs -notmatch [regex]::Escape($testPath) -or $healthTaskArgs -match "selftest-password") {
+        throw "SelfTest health-check task command failed."
+    }
+    $healthTrigger = New-HealthCheckTaskTrigger
+    if ([string]$healthTrigger.Repetition.Interval -ne "PT15M") {
+        throw "SelfTest recovery-check interval is not exactly 15 minutes."
     }
     foreach ($runtimePath in @($RuntimeLogDir, $RuntimeMarkerDir, $RuntimeStateDir)) {
         if ([string]::IsNullOrWhiteSpace($runtimePath)) {
@@ -553,7 +589,7 @@ $loginGroup.Controls.Add($autoCloseBox)
 $autoConnectBox = [System.Windows.Forms.CheckBox]::new()
 $autoConnectBox.Location = [System.Drawing.Point]::new(510, 60)
 $autoConnectBox.Size = [System.Drawing.Size]::new(180, 24)
-$autoConnectBox.Text = "登录后自动连接"
+$autoConnectBox.Text = "登录自连 + 15分钟网络检查"
 $autoConnectBox.Checked = [bool]$settings.AutoConnectOnLogon
 $loginGroup.Controls.Add($autoConnectBox)
 
@@ -743,8 +779,8 @@ function Start-StatusRefreshJob {
 
     $jobConfig = Get-StatusJobConfig
     $script:StatusJobMode = $Mode
-    $script:StatusJob = Start-Job -ArgumentList $Mode, $Label, $jobConfig, $StatePath, $AutoConnectTaskName, $MaskedAccount, $RuntimeScript -ScriptBlock {
-        param($Mode, $Label, $Config, $StatePathValue, $TaskName, $MaskedAccountValue, $RuntimeScriptPath)
+    $script:StatusJob = Start-Job -ArgumentList $Mode, $Label, $jobConfig, $StatePath, $AutoConnectTaskName, $HealthCheckTaskName, $MaskedAccount, $RuntimeScript -ScriptBlock {
+        param($Mode, $Label, $Config, $StatePathValue, $AutoTaskName, $HealthTaskName, $MaskedAccountValue, $RuntimeScriptPath)
 
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         if (-not (Test-Path -LiteralPath $RuntimeScriptPath)) {
@@ -800,16 +836,27 @@ function Start-StatusRefreshJob {
             $tunReady = ($tunAdapter -and $tunAdapter.Status -eq "Up")
             $ethernetReady = Test-TargetEthernetReady -Config $Config
             $stateExists = Test-Path -LiteralPath $StatePathValue
-            $taskSnapshot = Get-TaskSnapshot -TaskName $TaskName
+            $autoTaskSnapshot = Get-HitNetScheduledTaskSnapshot -TaskName $AutoTaskName -DisplayLabel "登录自动连接"
+            $healthTaskSnapshot = Get-HitNetScheduledTaskSnapshot -TaskName $HealthTaskName -DisplayLabel "15 分钟网络检查"
+            $taskSnapshot = [pscustomobject]@{
+                Enabled = [bool]($autoTaskSnapshot.Enabled -and $healthTaskSnapshot.Enabled)
+                Partial = [bool]($autoTaskSnapshot.Enabled -xor $healthTaskSnapshot.Enabled)
+                Text = ("{0}{1}{2}" -f $autoTaskSnapshot.Text, [Environment]::NewLine, $healthTaskSnapshot.Text)
+                ActionText = ("[{0}]{1}{2}{1}[{3}]{1}{4}" -f $AutoTaskName, [Environment]::NewLine, $autoTaskSnapshot.ActionText, $HealthTaskName, $healthTaskSnapshot.ActionText)
+            }
+            $rasEntries = Get-HitNetRasEntries
+            $rasEntriesSummary = Get-HitNetRasEntriesSummary -RasEntries $rasEntries
+            $rasEntryExists = Test-HitNetRasEntryExists -RasEntries $rasEntries -RasEntry $Config.RasEntry
 
-            $summary = "{0}: {1}    Clash: {2}    TUN: {3}    有线: {4}    状态文件: {5}    自启: {6}" -f `
+            $summary = "{0}({1}): {2}    Clash: {3}    TUN: {4}    有线: {5}    状态文件: {6}    自启: {7}" -f `
                 $Config.RasEntry,
+                $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }),
                 $(if ($rasConnected) { "已连接" } else { "未连接" }),
                 $(if ($proxyListening) { "已监听" } else { "未监听" }),
                 $(if ($tunReady) { "已就绪" } else { "未就绪" }),
                 $(if ($ethernetReady) { "已连接" } else { "未就绪" }),
                 $(if ($stateExists) { "存在" } else { "无" }),
-                $(if ($taskSnapshot.Enabled) { "已启用" } else { "未启用" })
+                $(if ($taskSnapshot.Enabled) { "已启用" } elseif ($taskSnapshot.Partial) { "部分启用" } else { "未启用" })
 
             $hintLines = New-Object System.Collections.Generic.List[string]
             if ([string]::IsNullOrWhiteSpace($Config.ClashPath) -or -not (Test-Path -LiteralPath $Config.ClashPath -ErrorAction SilentlyContinue)) {
@@ -817,6 +864,9 @@ function Start-StatusRefreshJob {
             }
             if (-not $proxyListening) {
                 $hintLines.Add("Clash 代理端口未监听：先启动 Clash Verge，并确认代理地址/端口正确。") | Out-Null
+            }
+            if (-not $rasEntryExists) {
+                $hintLines.Add(("未在 rasphone.pbk 中检测到 PPPoE 项 '{0}'。建议先执行 'rasphone.exe -a' 并确认名称一致。当前可见项：{1}" -f $Config.RasEntry, $rasEntriesSummary)) | Out-Null
             }
             if (-not $tunReady) {
                 $hintLines.Add("TUN 未就绪：先在 Clash Verge 中开启 TUN/Meta 网卡。") | Out-Null
@@ -834,7 +884,7 @@ function Start-StatusRefreshJob {
             $adapterObjects = @(Get-NetAdapter -ErrorAction SilentlyContinue)
             $nrptRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
                 Where-Object { $_.Comment -like "CodexClash*" -or $_.DisplayName -like "CodexClash*" })
-            $splitRoutes = @(Get-NetRoute -DestinationPrefix $prefixes -ErrorAction SilentlyContinue)
+            $splitRoutes = @(Get-HitNetRoutesByPrefix -DestinationPrefix $prefixes)
             $expectedRoutes = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
             $splitRoutesReady = $true
             foreach ($route in $expectedRoutes) {
@@ -870,7 +920,7 @@ function Start-StatusRefreshJob {
                 $diagLines.Add(("tun_ready={0}" -f $tunReady)) | Out-Null
                 $diagLines.Add(("ethernet_candidate_ready={0}" -f $ethernetReady)) | Out-Null
                 $diagLines.Add(("state_file_exists={0}" -f $stateExists)) | Out-Null
-                $diagLines.Add(("auto_connect_task_enabled={0}" -f $taskSnapshot.Enabled)) | Out-Null
+                $diagLines.Add(("automation_tasks_both_enabled={0} automation_tasks_partial={1}" -f $taskSnapshot.Enabled, $taskSnapshot.Partial)) | Out-Null
                 $diagLines.Add(("codex_nrpt_rule_count={0} required_nrpt_ready={1}" -f $nrptRules.Count, $requiredNrptReady)) | Out-Null
                 $diagLines.Add(("split_route_count={0} split_routes_ready={1}" -f $splitRoutes.Count, $splitRoutesReady)) | Out-Null
                 $diagLines.Add("不包含密码、日志全文、Clash 节点或本机完整路径。") | Out-Null
@@ -883,6 +933,8 @@ function Start-StatusRefreshJob {
             $lines.Add(("PPPoE: {0}" -f $Config.RasEntry)) | Out-Null
             $lines.Add(("Proxy: {0}" -f $Config.ProxyUrl)) | Out-Null
             $lines.Add(("TUN: {0}" -f $Config.TunInterfaceAlias)) | Out-Null
+            $lines.Add(("PPPoE项检测: {0} ({1})" -f $Config.RasEntry, $(if ($rasEntryExists) { "已检测到" } else { "未检测到" }))) | Out-Null
+            $lines.Add(("PPPoE项清单: {0}" -f $rasEntriesSummary)) | Out-Null
             $lines.Add(("ClashPath: {0}" -f $Config.ClashPath)) | Out-Null
             $lines.Add(("状态文件路径: {0}" -f $StatePathValue)) | Out-Null
             $lines.Add($taskSnapshot.Text) | Out-Null
@@ -922,12 +974,12 @@ function Start-StatusRefreshJob {
             $lines.Add("--- Codex split routes ---") | Out-Null
             $lines.Add($(if ([string]::IsNullOrWhiteSpace($routes)) { "(none)" } else { $routes.Trim() })) | Out-Null
 
-            $lines.Add("--- logon auto-connect task ---") | Out-Null
+            $lines.Add("--- logon auto-connect and 15-minute network-check tasks ---") | Out-Null
             $lines.Add($taskSnapshot.ActionText) | Out-Null
             return New-StatusResult -Mode $Mode -SummaryText $summary -AutoConnectEnabled $taskSnapshot.Enabled -AutoConnectStatusText $taskSnapshot.Text -DetailText ($lines -join [Environment]::NewLine) -HintText $hintText
         }
         catch {
-            return New-StatusResult -Mode $Mode -SummaryText "状态读取失败: $($_.Exception.Message)" -AutoConnectEnabled $false -AutoConnectStatusText "登录后自动连接: 未检查" -ErrorText $_.Exception.Message
+            return New-StatusResult -Mode $Mode -SummaryText "状态读取失败: $($_.Exception.Message)" -AutoConnectEnabled $false -AutoConnectStatusText "登录自动连接与 15 分钟网络检查: 未检查" -ErrorText $_.Exception.Message
         }
     }
     return $true
@@ -1094,25 +1146,25 @@ $autoConnectBox.Add_CheckedChanged({
 
             Register-AutoConnectTask
             Save-CurrentUiSettings
-            Append-Output "已启用登录后自动连接。任务将在当前 Windows 用户登录后延迟约 30 秒运行。"
+            Append-Output "已启用登录自动连接与 15 分钟网络检查。连续确认意外掉线后重拨，只启动已停止的 RayLink；健康连接保持在线。"
         }
         else {
             Unregister-AutoConnectTask
             Save-CurrentUiSettings
-            Append-Output "已关闭登录后自动连接。"
+            Append-Output "已关闭登录自动连接与 15 分钟网络检查。"
         }
-        Set-StateSummaryCache -Text "登录后自动连接设置已更新，正在刷新状态..." -AutoConnectEnabled $autoConnectBox.Checked
+        Set-StateSummaryCache -Text "自动连接与健康检查设置已更新，正在刷新状态..." -AutoConnectEnabled $autoConnectBox.Checked
         $statusLabel.Text = Get-StateSummary
         Start-StatusRefreshJob -Mode "Summary" -Label "自启设置后刷新" | Out-Null
     }
     catch {
         $message = $_.Exception.Message
-        Append-Output ("登录后自动连接设置失败: {0}" -f $message)
-        [System.Windows.Forms.MessageBox]::Show($message, "登录后自动连接", "OK", "Warning") | Out-Null
+        Append-Output ("自动连接与健康检查设置失败: {0}" -f $message)
+        [System.Windows.Forms.MessageBox]::Show($message, "自动连接与健康检查", "OK", "Warning") | Out-Null
         $knownAutoState = if ($null -ne $script:StateSummaryCache.AutoConnectEnabled) { [bool]$script:StateSummaryCache.AutoConnectEnabled } else { $false }
         Set-AutoConnectChecked -Checked $knownAutoState
         Save-CurrentUiSettings
-        Set-StateSummaryCache -Text "登录后自动连接设置失败，正在刷新状态..."
+        Set-StateSummaryCache -Text "自动连接与健康检查设置失败，正在刷新状态..."
         $statusLabel.Text = Get-StateSummary
         Start-StatusRefreshJob -Mode "Summary" -Label "自启设置失败后刷新" | Out-Null
     }

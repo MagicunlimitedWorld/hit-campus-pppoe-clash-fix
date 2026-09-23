@@ -122,7 +122,7 @@ function Invoke-CurlProbe {
             "--max-time", "$MaxTime",
             "-o", "NUL",
             "-s",
-            "-w", "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n"
+            "-w", "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n"
         )
         if ($UseProxy) {
             $args += @("--proxy", $ProxyUrl)
@@ -384,13 +384,15 @@ function Add-TrialSplitRoute {
         return
     }
 
-    New-NetRoute -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
+    New-NetRoute -PolicyStore ActiveStore -DestinationPrefix $DestinationPrefix -InterfaceIndex $InterfaceIndex -NextHop $NextHop -RouteMetric 0 -ErrorAction Stop | Out-Null
     $script:SplitRouteTrialAddedRoutes.Add([pscustomobject]@{
         DestinationPrefix = $DestinationPrefix
         InterfaceIndex = $InterfaceIndex
         InterfaceAlias = $InterfaceAlias
         NextHop = $NextHop
         AddressFamily = $AddressFamily
+        Ownership = 'Created'
+        PolicyStore = 'ActiveStore'
     }) | Out-Null
 }
 
@@ -432,8 +434,7 @@ function Restore-TrialIpv6SplitRoute {
     else {
         foreach ($route in $routes) {
             Invoke-Logged ("Split route remove temporary route {0}" -f $route.DestinationPrefix) {
-                Get-NetRoute -DestinationPrefix $route.DestinationPrefix -InterfaceIndex $route.InterfaceIndex -NextHop $route.NextHop -ErrorAction SilentlyContinue |
-                    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-NetRoute -PolicyStore ActiveStore -DestinationPrefix $route.DestinationPrefix -InterfaceIndex $route.InterfaceIndex -NextHop $route.NextHop -Confirm:$false -ErrorAction SilentlyContinue
             }
         }
         $script:SplitRouteTrialAddedRoutes.Clear()
@@ -897,7 +898,7 @@ function Write-CodexConnectivitySnapshot {
         )
         foreach ($url in $urls) {
             "--- $url ---"
-            & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" $url
+            & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n" $url
         }
     }
 
@@ -909,7 +910,7 @@ function Write-CodexConnectivitySnapshot {
         )
         foreach ($url in $urls) {
             "--- $url ---"
-            & curl.exe -I -L --max-time 8 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" $url
+            & curl.exe -I -L --max-time 8 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n" $url
         }
     }
 }

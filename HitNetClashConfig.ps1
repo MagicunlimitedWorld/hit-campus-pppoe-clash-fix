@@ -59,17 +59,13 @@ function Expand-HitNetPath {
 
 function Get-HitNetJsonObject {
     param([string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
-        return $null
-    }
-
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
     try {
-        return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $value = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $value -or $value -isnot [pscustomobject]) { throw 'Expected a JSON object.' }
+        return $value
     }
-    catch {
-        return $null
-    }
+    catch { throw "INVALID_JSON: $Path. Restore a valid settings/state file; defaults were not substituted." }
 }
 
 function Get-HitNetValue {

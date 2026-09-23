@@ -1,6 +1,7 @@
 param(
     [string]$SettingsPath,
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [switch]$HealthCheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,7 +32,7 @@ if (-not (Test-Path -LiteralPath $RuntimeLogDir)) {
     New-Item -Path $RuntimeLogDir -ItemType Directory -Force | Out-Null
 }
 
-$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
 $LogPath = Join-Path $RuntimeLogDir ("auto_connect_{0}.log" -f $Timestamp)
 
 function Write-AutoLog {
@@ -89,6 +90,14 @@ function Test-SplitRoutesReady {
     return (Test-HitNetSplitRoutesReady -TunInterfaceAlias $TunInterfaceAlias -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
 }
 
+function Assert-RasEntryConfig {
+    $entries = Get-HitNetRasEntries
+    Write-AutoLog ("Ras phonebook scan: {0}" -f (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    if (-not (Test-HitNetRasEntryExists -RasEntries $entries -RasEntry $Config.RasEntry)) {
+        throw ("RAS_ENTRY_NOT_FOUND: no entry named '{0}' in rasphone.pbk. Available: {1}. Recreate/fix via 'rasphone.exe -a' and keep exact name." -f $Config.RasEntry, (Get-HitNetRasEntriesSummary -RasEntries $entries))
+    }
+}
+
 function Test-AlreadyConnected {
     param($Config)
 
@@ -101,20 +110,83 @@ function Test-AlreadyConnected {
     )
 }
 
+function Invoke-HealthCheckOnly {
+    $reconcileLines = New-Object System.Collections.Generic.List[string]
+    try {
+        & $EnterScript `
+            -RasEntry $Config.RasEntry `
+            -ProxyUrl $Config.ProxyUrl `
+            -TunInterfaceAlias $Config.TunInterfaceAlias `
+            -TunIpv4Gateway $Config.TunIpv4Gateway `
+            -TunIpv6Gateway $Config.TunIpv6Gateway `
+            -ClashPath $Config.ClashPath `
+            -SettingsPath $SettingsPath `
+            -ProbeMode Minimal `
+            -ReconcileOnly 2>&1 |
+            ForEach-Object {
+                $line = $_.ToString()
+                $reconcileLines.Add($line) | Out-Null
+                Write-AutoLog $line
+            }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        if ($failure -match "RECONCILE_BLOCKED") {
+            Write-AutoLog ("HEALTH_CHECK_BLOCKED: {0}" -f $failure)
+        }
+        else {
+            Write-AutoLog ("HEALTH_CHECK_FAILED: {0}" -f $failure)
+        }
+        throw
+    }
+
+    $reconcileText = $reconcileLines -join [Environment]::NewLine
+    if ($reconcileText -match "RECONCILE_REPAIRED") {
+        Write-AutoLog "HEALTH_CHECK_REPAIRED"
+        return
+    }
+    if ($reconcileText -match "RECONCILE_ALREADY_OK") {
+        Write-AutoLog "HEALTH_CHECK_ALREADY_OK"
+        return
+    }
+    if ($reconcileText -match "RECONCILE_SKIPPED_([A-Z0-9_]+)") {
+        Write-AutoLog ("HEALTH_CHECK_SKIPPED_{0}" -f $Matches[1])
+        return
+    }
+
+    Write-AutoLog "HEALTH_CHECK_FAILED: reconcile script returned no recognized terminal status."
+    throw "Health check reconcile script returned no recognized terminal status."
+}
+
 $Config = Resolve-HitNetClashConfig -ScriptDir $ScriptDir -SettingsPath $SettingsPath
 
 Write-AutoLog ("LogPath={0}" -f $LogPath)
-Write-AutoLog "Purpose=logon auto-connect for HIT PPPoE plus Clash."
+if ($HealthCheckOnly) {
+    Write-AutoLog "Purpose=low-frequency health reconciliation; never dial PPPoE or start, stop, or restart Clash/RayLink."
+}
+else {
+    Write-AutoLog "Purpose=logon auto-connect for HIT PPPoE plus Clash."
+}
 Write-AutoLog ("SettingsPath={0}" -f $SettingsPath)
 Write-AutoLog ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2} ClashPath={3}" -f $Config.RasEntry, $Config.ProxyUrl, $Config.TunInterfaceAlias, $Config.ClashPath)
 
+if ($ValidateOnly -and $HealthCheckOnly) {
+    Write-AutoLog "HEALTH_CHECK_FAILED: ValidateOnly and HealthCheckOnly cannot be combined."
+    throw "ValidateOnly and HealthCheckOnly cannot be combined."
+}
+if ($HealthCheckOnly) {
+    Invoke-HealthCheckOnly
+    return
+}
+
 try {
-    $credential = Get-SavedCredential
+    Assert-RasEntryConfig
     if ($ValidateOnly) {
         Write-AutoLog "AUTO_CONNECT_VALIDATE_OK"
         return
     }
 
+    $credential = Get-SavedCredential
     if (Test-AlreadyConnected -Config $Config) {
         Write-AutoLog "AUTO_CONNECT_ALREADY_OK"
         return

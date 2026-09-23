@@ -1,0 +1,24 @@
+name: Windows PowerShell checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  mocked-network-checks:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require Windows PowerShell 5.1
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Windows PowerShell 5.1 is required.' }
+      - name: Parse scripts and verify resource, credential and rollback behavior
+        run: .\Test-HitNetClashStability.ps1
+      - name: Verify 15-minute guard with mocked networking and services
+        run: .\Test-HitNetClashGuard.ps1
