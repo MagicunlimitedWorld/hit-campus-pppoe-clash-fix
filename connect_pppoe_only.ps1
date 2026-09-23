@@ -119,7 +119,7 @@ function Assert-RasEntryExists {
 
 function Get-ExistingClashRouteSummary {
     $expected = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $Config.TunIpv4Gateway -TunIpv6Gateway $Config.TunIpv6Gateway)
-    $routes = Get-NetRoute -DestinationPrefix ($expected.Prefix) -ErrorAction SilentlyContinue |
+    $routes = Get-HitNetRoutesByPrefix -DestinationPrefix @($expected.Prefix) |
         Where-Object {
             $_.InterfaceAlias -eq $Config.TunInterfaceAlias -or
             $_.NextHop -in @($Config.TunIpv4Gateway, $Config.TunIpv6Gateway)

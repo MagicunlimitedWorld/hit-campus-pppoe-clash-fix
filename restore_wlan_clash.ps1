@@ -153,7 +153,7 @@ function Write-FinalSnapshot {
             & rasdial.exe
         }
         Invoke-Logged "final default and split routes" {
-            Get-NetRoute -DestinationPrefix "0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1" -ErrorAction SilentlyContinue |
+            Get-HitNetRoutesByPrefix -DestinationPrefix @("0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0", "::/1", "8000::/1") |
                 Sort-Object AddressFamily, DestinationPrefix, RouteMetric, InterfaceMetric |
                 Select-Object DestinationPrefix, NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric, AddressFamily |
                 Format-Table -AutoSize
@@ -188,7 +188,7 @@ function Write-FinalSnapshot {
         Invoke-Logged "final Clash proxy OpenAI probe" {
             $attempts = if ($ProbeMode -eq "Full") { [Math]::Max(3, $ProbeAttempts) } else { [Math]::Max(1, $ProbeAttempts) }
             for ($attempt = 1; $attempt -le $attempts; $attempt++) {
-                $result = & curl.exe -I -L --connect-timeout 3 --max-time 8 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" "https://api.openai.com/v1/models"
+                $result = & curl.exe -I -L --connect-timeout 3 --max-time 8 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s err=%{errormsg}`n" "https://api.openai.com/v1/models"
                 "attempt $attempt/$attempts $result"
                 if ($result -match "code=(?!000)\d{3}") {
                     "EXTERNAL_CONNECTIVITY_PROBE_OK: final Clash proxy OpenAI probe returned a HTTP code."
@@ -212,10 +212,17 @@ Write-Log ("EffectiveConfig RasEntry={0} ProxyUrl={1} TunInterfaceAlias={2}" -f 
 Write-Log ("ProbeMode={0}" -f $ProbeMode)
 Write-Log "Purpose=restore WLAN plus Clash by removing Codex PPPoE temporary networking changes."
 
-Remove-CodexNrptRules
-Remove-CodexSplitRoutes
-Disconnect-RasIfNeeded
-Remove-StateFile
-Wait-RestoreSettled
-Write-FinalSnapshot
-Write-Log "RESTORE_WLAN_CLASH_DONE: local restore workflow completed; external probe warnings above are informational."
+$restoreLock = New-HitNetNamedMutexState -Name "Local\HitCampusPppoeClashEnter"
+if (-not (Acquire-HitNetNamedMutex -State $restoreLock -WaitSeconds 3)) {
+    throw "RESTORE_BUSY: a connection operation is active; retry after it finishes."
+}
+try {
+    Remove-CodexNrptRules
+    Remove-CodexSplitRoutes
+    Disconnect-RasIfNeeded
+    Remove-StateFile
+    Wait-RestoreSettled
+    Write-FinalSnapshot
+    Write-Log "RESTORE_WLAN_CLASH_DONE: local restore workflow completed; external probe warnings above are informational."
+}
+finally { Release-HitNetNamedMutex -State $restoreLock }

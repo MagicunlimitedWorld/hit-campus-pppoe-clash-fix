@@ -261,6 +261,17 @@ function Test-HitNetEthernetReady {
     return $false
 }
 
+function Get-HitNetRoutesByPrefix {
+    param([Parameter(Mandatory = $true)][string[]]$DestinationPrefix)
+
+    foreach ($prefix in @($DestinationPrefix)) {
+        if ([string]::IsNullOrWhiteSpace($prefix)) {
+            continue
+        }
+        Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-HitNetExpectedSplitRoutes {
     param(
         [Parameter(Mandatory = $true)][string]$TunIpv4Gateway,
@@ -283,7 +294,7 @@ function Test-HitNetSplitRoutesReady {
     )
 
     $expected = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
-    $routeTable = @(Get-NetRoute -DestinationPrefix ($expected.Prefix) -ErrorAction SilentlyContinue |
+    $routeTable = @(Get-HitNetRoutesByPrefix -DestinationPrefix @($expected.Prefix) |
         Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
 
     foreach ($route in $expected) {
@@ -305,7 +316,7 @@ function Test-HitNetSplitRoutesRemoved {
     )
 
     $expected = @(Get-HitNetExpectedSplitRoutes -TunIpv4Gateway $TunIpv4Gateway -TunIpv6Gateway $TunIpv6Gateway)
-    $routeTable = @(Get-NetRoute -DestinationPrefix ($expected.Prefix) -ErrorAction SilentlyContinue |
+    $routeTable = @(Get-HitNetRoutesByPrefix -DestinationPrefix @($expected.Prefix) |
         Where-Object { $_.InterfaceAlias -eq $TunInterfaceAlias })
 
     foreach ($route in $expected) {
@@ -381,6 +392,217 @@ function Test-HitNetNrptRulesReady {
         }
     }
     return $true
+}
+
+function Test-HitNetProjectNrptRule {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Rule,
+        [string[]]$RecordedRuleNames = @()
+    )
+
+    if ($Rule.Name -and @($RecordedRuleNames) -contains [string]$Rule.Name) {
+        return $true
+    }
+
+    return (
+        [string]$Rule.Comment -like "CodexClashEnter*" -or
+        [string]$Rule.DisplayName -like "CodexClashEnter*" -or
+        [string]$Rule.Comment -like "CodexClashTrial*" -or
+        [string]$Rule.DisplayName -like "CodexClashTrial*"
+    )
+}
+
+function New-HitNetReconcilePlan {
+    param(
+        $ActiveState,
+        [bool]$RasConnected,
+        [bool]$ProxyListening,
+        [bool]$TunReady,
+        [Parameter(Mandatory = $true)][string]$RasEntry,
+        [Parameter(Mandatory = $true)][string]$TunInterfaceAlias,
+        [int]$TunInterfaceIndex,
+        [Parameter(Mandatory = $true)][string]$TunIpv4Gateway,
+        [Parameter(Mandatory = $true)][string]$TunIpv6Gateway,
+        [Parameter(Mandatory = $true)][string[]]$NrptNamespaces,
+        [object[]]$NrptRules = @(),
+        [object[]]$Routes = @(),
+        [string]$NameServer = "198.18.0.2"
+    )
+
+    $result = [ordered]@{
+        Code = ""
+        Reason = ""
+        NrptNamespacesToAdd = @()
+        NrptRuleNames = @()
+        RoutesToAdd = @()
+        RoutesToRemove = @()
+        ExpectedRoutes = @()
+        StateNeedsUpdate = $false
+    }
+
+    if ($null -eq $ActiveState) {
+        $result.Code = "SKIPPED_INACTIVE"
+        $result.Reason = "The project active-state file does not exist."
+        return [pscustomobject]$result
+    }
+    if (-not $RasConnected) {
+        $result.Code = "SKIPPED_RAS_DISCONNECTED"
+        $result.Reason = "The configured PPPoE session is not connected."
+        return [pscustomobject]$result
+    }
+    if (-not $ProxyListening) {
+        $result.Code = "BLOCKED_PROXY_UNAVAILABLE"
+        $result.Reason = "The configured local proxy port is not listening."
+        return [pscustomobject]$result
+    }
+    if (-not $TunReady) {
+        $result.Code = "BLOCKED_TUN_UNAVAILABLE"
+        $result.Reason = "The configured Meta/TUN adapter is not Up."
+        return [pscustomobject]$result
+    }
+    if ($TunInterfaceIndex -le 0) {
+        $result.Code = "BLOCKED_TUN_INTERFACE_INDEX"
+        $result.Reason = "The current Meta/TUN interface index is unavailable."
+        return [pscustomobject]$result
+    }
+    if ([string]::IsNullOrWhiteSpace($TunIpv4Gateway) -or [string]::IsNullOrWhiteSpace($TunIpv6Gateway)) {
+        $result.Code = "BLOCKED_TUN_GATEWAY"
+        $result.Reason = "The current Meta/TUN gateway is unavailable."
+        return [pscustomobject]$result
+    }
+
+    $stateRasEntry = [string]$ActiveState.RasEntry
+    $stateTunAlias = [string]$ActiveState.TunInterfaceAlias
+    if (
+        [string]::IsNullOrWhiteSpace($stateRasEntry) -or
+        -not $stateRasEntry.Equals($RasEntry, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]::IsNullOrWhiteSpace($stateTunAlias) -or
+        -not $stateTunAlias.Equals($TunInterfaceAlias, [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        $result.Code = "BLOCKED_STATE_MISMATCH"
+        $result.Reason = "The active-state PPPoE or TUN binding does not match the current configuration."
+        return [pscustomobject]$result
+    }
+
+    $expectedRoutes = @(
+        [pscustomobject]@{ DestinationPrefix = "0.0.0.0/1"; InterfaceIndex = $TunInterfaceIndex; NextHop = $TunIpv4Gateway; AddressFamily = "IPv4" },
+        [pscustomobject]@{ DestinationPrefix = "128.0.0.0/1"; InterfaceIndex = $TunInterfaceIndex; NextHop = $TunIpv4Gateway; AddressFamily = "IPv4" },
+        [pscustomobject]@{ DestinationPrefix = "::/1"; InterfaceIndex = $TunInterfaceIndex; NextHop = $TunIpv6Gateway; AddressFamily = "IPv6" },
+        [pscustomobject]@{ DestinationPrefix = "8000::/1"; InterfaceIndex = $TunInterfaceIndex; NextHop = $TunIpv6Gateway; AddressFamily = "IPv6" }
+    )
+    $result.ExpectedRoutes = $expectedRoutes
+
+    $recordedRuleNames = @($ActiveState.NrptRuleNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $validRuleNames = New-Object System.Collections.Generic.List[string]
+    $namespacesToAdd = New-Object System.Collections.Generic.List[string]
+    $conflicts = New-Object System.Collections.Generic.List[string]
+
+    foreach ($namespace in @($NrptNamespaces)) {
+        if ([string]::IsNullOrWhiteSpace($namespace)) {
+            continue
+        }
+
+        $matchingRules = @($NrptRules | Where-Object { @($_.Namespace) -contains $namespace })
+        $projectRules = @($matchingRules | Where-Object { Test-HitNetProjectNrptRule -Rule $_ -RecordedRuleNames $recordedRuleNames })
+        $foreignRules = @($matchingRules | Where-Object { -not (Test-HitNetProjectNrptRule -Rule $_ -RecordedRuleNames $recordedRuleNames) })
+        if ($foreignRules.Count -gt 0) {
+            $conflicts.Add($namespace) | Out-Null
+            continue
+        }
+
+        $validProjectRules = @($projectRules | Where-Object { @($_.NameServers) -contains $NameServer })
+        if ($validProjectRules.Count -eq 0) {
+            if ($projectRules.Count -gt 0) {
+                $conflicts.Add($namespace) | Out-Null
+            }
+            else {
+                $namespacesToAdd.Add($namespace) | Out-Null
+            }
+            continue
+        }
+
+        foreach ($rule in $validProjectRules) {
+            if ($rule.Name -and $validRuleNames -notcontains [string]$rule.Name) {
+                $validRuleNames.Add([string]$rule.Name) | Out-Null
+            }
+        }
+    }
+
+    if ($conflicts.Count -gt 0) {
+        $result.Code = "BLOCKED_NRPT_CONFLICT"
+        $result.Reason = "A foreign or incompatible NRPT rule exists for: $($conflicts -join ', ')."
+        return [pscustomobject]$result
+    }
+
+    $result.NrptNamespacesToAdd = @($namespacesToAdd)
+    $result.NrptRuleNames = @($validRuleNames)
+
+    $routesToAdd = New-Object System.Collections.Generic.List[object]
+    foreach ($expected in $expectedRoutes) {
+        $found = $Routes |
+            Where-Object {
+                $_.DestinationPrefix -eq $expected.DestinationPrefix -and
+                [int]$_.InterfaceIndex -eq [int]$expected.InterfaceIndex -and
+                [string]$_.NextHop -eq [string]$expected.NextHop
+            } |
+            Select-Object -First 1
+        if (-not $found) {
+            $routesToAdd.Add($expected) | Out-Null
+        }
+    }
+    $result.RoutesToAdd = @($routesToAdd | ForEach-Object { $_ })
+
+    $expectedPrefixes = @($expectedRoutes | ForEach-Object { $_.DestinationPrefix })
+    $routesToRemove = New-Object System.Collections.Generic.List[object]
+    foreach ($recorded in @($ActiveState.Routes)) {
+        if ($null -eq $recorded -or $expectedPrefixes -notcontains [string]$recorded.DestinationPrefix) {
+            continue
+        }
+        $stillExpected = $expectedRoutes |
+            Where-Object {
+                $_.DestinationPrefix -eq [string]$recorded.DestinationPrefix -and
+                [int]$_.InterfaceIndex -eq [int]$recorded.InterfaceIndex -and
+                [string]$_.NextHop -eq [string]$recorded.NextHop
+            } |
+            Select-Object -First 1
+        if ($stillExpected) {
+            continue
+        }
+
+        $exists = $Routes |
+            Where-Object {
+                $_.DestinationPrefix -eq [string]$recorded.DestinationPrefix -and
+                [int]$_.InterfaceIndex -eq [int]$recorded.InterfaceIndex -and
+                [string]$_.NextHop -eq [string]$recorded.NextHop
+            } |
+            Select-Object -First 1
+        if ($exists) {
+            $routesToRemove.Add([pscustomobject]@{
+                DestinationPrefix = [string]$recorded.DestinationPrefix
+                InterfaceIndex = [int]$recorded.InterfaceIndex
+                NextHop = [string]$recorded.NextHop
+                AddressFamily = [string]$recorded.AddressFamily
+            }) | Out-Null
+        }
+    }
+    $result.RoutesToRemove = @($routesToRemove | ForEach-Object { $_ })
+
+    $expectedRouteKeys = @($expectedRoutes | ForEach-Object { "{0}|{1}|{2}" -f $_.DestinationPrefix, $_.InterfaceIndex, $_.NextHop } | Sort-Object -Unique)
+    $stateRouteKeys = @($ActiveState.Routes | ForEach-Object { "{0}|{1}|{2}" -f $_.DestinationPrefix, $_.InterfaceIndex, $_.NextHop } | Sort-Object -Unique)
+    $ruleNamesDiffer = @((Compare-Object -ReferenceObject @($recordedRuleNames | Sort-Object -Unique) -DifferenceObject @($validRuleNames | Sort-Object -Unique))).Count -gt 0
+    $routeStateDiffers = @((Compare-Object -ReferenceObject $stateRouteKeys -DifferenceObject $expectedRouteKeys)).Count -gt 0
+    $result.StateNeedsUpdate = ($ruleNamesDiffer -or $routeStateDiffers -or $namespacesToAdd.Count -gt 0)
+
+    if ($routesToAdd.Count -gt 0 -or $routesToRemove.Count -gt 0 -or $namespacesToAdd.Count -gt 0 -or $result.StateNeedsUpdate) {
+        $result.Code = "REPAIR_NEEDED"
+        $result.Reason = "One or more project-owned NRPT, split-route, or state entries need reconciliation."
+    }
+    else {
+        $result.Code = "ALREADY_OK"
+        $result.Reason = "Project-owned NRPT and split routes already match the current Meta/TUN binding."
+    }
+    return [pscustomobject]$result
 }
 
 function New-HitNetNamedMutexState {
@@ -589,23 +811,68 @@ function Test-HitNetWorkspacePath {
     return $full.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Write-HitNetJsonAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$InputObject,
+        [int]$Depth = 8
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $parent = Split-Path -Parent $fullPath
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        throw "Atomic JSON target must have a parent directory: $fullPath"
+    }
+    if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    }
+
+    $nonce = [guid]::NewGuid().ToString("N")
+    $tempPath = Join-Path $parent (".{0}.{1}.tmp" -f ([System.IO.Path]::GetFileName($fullPath)), $nonce)
+    $backupPath = Join-Path $parent (".{0}.{1}.bak" -f ([System.IO.Path]::GetFileName($fullPath)), $nonce)
+    try {
+        $json = $InputObject | ConvertTo-Json -Depth $Depth
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($tempPath, $json, $encoding)
+        Get-Content -LiteralPath $tempPath -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null
+
+        if (Test-Path -LiteralPath $fullPath) {
+            [System.IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
+        }
+        else {
+            [System.IO.File]::Move($tempPath, $fullPath)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $backupPath) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-HitNetScheduledTaskSnapshot {
-    param([Parameter(Mandatory = $true)][string]$TaskName)
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [string]$DisplayLabel = "Auto-connect on logon"
+    )
 
     try {
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $task) {
             return [pscustomobject]@{
                 Enabled = $false
-                Text = "Auto-connect on logon: disabled"
+                Text = "${DisplayLabel}: disabled"
                 ActionText = "(not registered)"
             }
         }
 
-        $text = "Auto-connect on logon: enabled State=$($task.State)"
+        $text = "${DisplayLabel}: enabled State=$($task.State)"
         try {
             $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
-            $text = "Auto-connect on logon: enabled State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
+            $text = "${DisplayLabel}: enabled State=$($task.State) LastRun=$($info.LastRunTime) LastResult=$($info.LastTaskResult)"
         }
         catch {
         }
@@ -624,7 +891,7 @@ function Get-HitNetScheduledTaskSnapshot {
     catch {
         return [pscustomobject]@{
             Enabled = $false
-            Text = "Auto-connect on logon: not checked"
+            Text = "${DisplayLabel}: not checked"
             ActionText = "(task query failed: $($_.Exception.Message))"
         }
     }

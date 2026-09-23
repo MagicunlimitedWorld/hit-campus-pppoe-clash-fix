@@ -122,7 +122,7 @@ function Invoke-CurlProbe {
             "--max-time", "$MaxTime",
             "-o", "NUL",
             "-s",
-            "-w", "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n"
+            "-w", "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n"
         )
         if ($UseProxy) {
             $args += @("--proxy", $ProxyUrl)
@@ -897,7 +897,7 @@ function Write-CodexConnectivitySnapshot {
         )
         foreach ($url in $urls) {
             "--- $url ---"
-            & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" $url
+            & curl.exe -I -L --max-time 15 --proxy $ProxyUrl -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n" $url
         }
     }
 
@@ -909,7 +909,7 @@ function Write-CodexConnectivitySnapshot {
         )
         foreach ($url in $urls) {
             "--- $url ---"
-            & curl.exe -I -L --max-time 8 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip} err=%{errormsg}`n" $url
+            & curl.exe -I -L --max-time 8 --noproxy "*" -o NUL -s -w "code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s starttransfer=%{time_starttransfer}s total=%{time_total}s err=%{errormsg}`n" $url
         }
     }
 }

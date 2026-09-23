@@ -170,6 +170,117 @@ function Invoke-NativeCapture {
     }
 }
 
+function Invoke-ReconcilePlannerChecks {
+    $namespaces = @(".openai.com", ".chatgpt.com")
+    $expectedRoutes = @(
+        [pscustomobject]@{ DestinationPrefix = "0.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4" },
+        [pscustomobject]@{ DestinationPrefix = "128.0.0.0/1"; InterfaceIndex = 4; NextHop = "198.18.0.2"; AddressFamily = "IPv4" },
+        [pscustomobject]@{ DestinationPrefix = "::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6" },
+        [pscustomobject]@{ DestinationPrefix = "8000::/1"; InterfaceIndex = 4; NextHop = "fdfe:dcba:9876::2"; AddressFamily = "IPv6" }
+    )
+    $rules = @(
+        [pscustomobject]@{ Name = "rule-openai"; Namespace = @(".openai.com"); NameServers = @("198.18.0.2"); Comment = "CodexClashEnter test"; DisplayName = "CodexClashEnter-openai" },
+        [pscustomobject]@{ Name = "rule-chatgpt"; Namespace = @(".chatgpt.com"); NameServers = @("198.18.0.2"); Comment = "CodexClashEnter test"; DisplayName = "CodexClashEnter-chatgpt" }
+    )
+    $state = [pscustomobject]@{
+        RasEntry = "HITnet"
+        TunInterfaceAlias = "Meta"
+        NrptRuleNames = @("rule-openai", "rule-chatgpt")
+        Routes = @($expectedRoutes)
+    }
+    $common = @{
+        ActiveState = $state
+        RasConnected = $true
+        ProxyListening = $true
+        TunReady = $true
+        RasEntry = "HITnet"
+        TunInterfaceAlias = "Meta"
+        TunInterfaceIndex = 4
+        TunIpv4Gateway = "198.18.0.2"
+        TunIpv6Gateway = "fdfe:dcba:9876::2"
+        NrptNamespaces = $namespaces
+        NrptRules = $rules
+        Routes = $expectedRoutes
+    }
+
+    $plan = New-HitNetReconcilePlan @common
+    if ($plan.Code -ne "ALREADY_OK") {
+        throw "Healthy fixture should be ALREADY_OK, got $($plan.Code)."
+    }
+
+    $missingRouteArgs = $common.Clone()
+    $missingRouteArgs.Routes = @($expectedRoutes | Select-Object -First 3)
+    $plan = New-HitNetReconcilePlan @missingRouteArgs
+    if ($plan.Code -ne "REPAIR_NEEDED" -or $plan.RoutesToAdd.Count -ne 1) {
+        throw "Missing-route fixture did not request exactly one route repair."
+    }
+
+    $ifIndexArgs = $common.Clone()
+    $ifIndexArgs.TunInterfaceIndex = 9
+    $plan = New-HitNetReconcilePlan @ifIndexArgs
+    if ($plan.Code -ne "REPAIR_NEEDED" -or $plan.RoutesToAdd.Count -ne 4 -or $plan.RoutesToRemove.Count -ne 4) {
+        throw "Meta ifIndex-change fixture did not replace the four state-recorded routes."
+    }
+
+    $missingNrptArgs = $common.Clone()
+    $missingNrptArgs.NrptRules = @($rules | Where-Object { $_.Name -ne "rule-chatgpt" })
+    $plan = New-HitNetReconcilePlan @missingNrptArgs
+    if ($plan.Code -ne "REPAIR_NEEDED" -or @($plan.NrptNamespacesToAdd) -notcontains ".chatgpt.com") {
+        throw "Missing-NRPT fixture did not request the missing project rule."
+    }
+
+    $conflictArgs = $common.Clone()
+    $conflictArgs.NrptRules = @(
+        $rules[0],
+        [pscustomobject]@{ Name = "foreign-rule"; Namespace = @(".chatgpt.com"); NameServers = @("10.0.0.53"); Comment = "Corporate policy"; DisplayName = "Corporate policy" }
+    )
+    $plan = New-HitNetReconcilePlan @conflictArgs
+    if ($plan.Code -ne "BLOCKED_NRPT_CONFLICT") {
+        throw "Foreign NRPT fixture should be blocked, got $($plan.Code)."
+    }
+
+    $proxyArgs = $common.Clone()
+    $proxyArgs.ProxyListening = $false
+    if ((New-HitNetReconcilePlan @proxyArgs).Code -ne "BLOCKED_PROXY_UNAVAILABLE") {
+        throw "Proxy-unavailable fixture should be blocked."
+    }
+    $tunArgs = $common.Clone()
+    $tunArgs.TunReady = $false
+    if ((New-HitNetReconcilePlan @tunArgs).Code -ne "BLOCKED_TUN_UNAVAILABLE") {
+        throw "TUN-unavailable fixture should be blocked."
+    }
+    $rasArgs = $common.Clone()
+    $rasArgs.RasConnected = $false
+    if ((New-HitNetReconcilePlan @rasArgs).Code -ne "SKIPPED_RAS_DISCONNECTED") {
+        throw "Disconnected-PPPoE fixture should be skipped without dialing."
+    }
+    $inactiveArgs = $common.Clone()
+    $inactiveArgs.ActiveState = $null
+    if ((New-HitNetReconcilePlan @inactiveArgs).Code -ne "SKIPPED_INACTIVE") {
+        throw "Missing-active-state fixture should be skipped."
+    }
+}
+
+function Invoke-AtomicStateChecks {
+    $tmpRoot = Join-Path $ScriptDir ".runtime\atomic-state-test"
+    $testPath = Join-Path $tmpRoot "state.json"
+    try {
+        Write-HitNetJsonAtomic -Path $testPath -InputObject ([pscustomobject]@{ Version = 1; Value = "before" })
+        Write-HitNetJsonAtomic -Path $testPath -InputObject ([pscustomobject]@{ Version = 2; Value = "after" })
+        $loaded = Get-Content -LiteralPath $testPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([int]$loaded.Version -ne 2 -or [string]$loaded.Value -ne "after") {
+            throw "Atomic state replacement did not preserve the final complete JSON object."
+        }
+        $leftovers = @(Get-ChildItem -LiteralPath $tmpRoot -Filter "*.tmp" -File -ErrorAction SilentlyContinue)
+        if ($leftovers.Count -gt 0) {
+            throw "Atomic state replacement left temporary files behind."
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Push-Location $ScriptDir
 try {
     Invoke-Check -Name "PowerShell parser" -Script {
@@ -208,6 +319,67 @@ try {
         finally {
             Remove-Item -LiteralPath $testSettings -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    Invoke-Check -Name "connection guard mocked recovery" -Script {
+        Invoke-ExternalPowerShell -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $ScriptDir "Test-HitNetClashGuard.ps1")) -RequiredToken "HITNET_GUARD_TEST_OK"
+    }
+
+    Invoke-Check -Name "CLI compatibility" -Script {
+        $expectedParameters = @{
+            "enter_pppoe_codex.ps1" = @("ReconcileOnly", "ProbeMode", "SettingsPath")
+            "auto_connect_pppoe_clash.ps1" = @("HealthCheckOnly", "ValidateOnly", "SettingsPath")
+            "guard_pppoe_clash.ps1" = @("ObserveOnly", "SettingsPath")
+        }
+        foreach ($fileName in $expectedParameters.Keys) {
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $ScriptDir $fileName), [ref]$tokens, [ref]$errors)
+            $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+            foreach ($parameterName in $expectedParameters[$fileName]) {
+                if ($parameterNames -notcontains $parameterName) {
+                    throw "$fileName is missing required CLI parameter $parameterName."
+                }
+            }
+        }
+    }
+
+    Invoke-Check -Name "health path process-safety boundary" -Script {
+        $enterTokens = $null
+        $enterErrors = $null
+        $enterAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $ScriptDir "enter_pppoe_codex.ps1"), [ref]$enterTokens, [ref]$enterErrors)
+        $reconcileFunction = $enterAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Invoke-ReconcileOnly"
+        }, $true)
+        if (-not $reconcileFunction) {
+            throw "Invoke-ReconcileOnly function was not found."
+        }
+        if ($reconcileFunction.Extent.Text -match "(?i)Start-Process|Stop-Process|Connect-Ras|Restore-OnFailure|rasdial\.exe") {
+            throw "Invoke-ReconcileOnly contains a forbidden dial or process-control operation."
+        }
+
+        $autoTokens = $null
+        $autoErrors = $null
+        $autoAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $ScriptDir "auto_connect_pppoe_clash.ps1"), [ref]$autoTokens, [ref]$autoErrors)
+        $healthFunction = $autoAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Invoke-HealthCheckOnly"
+        }, $true)
+        if (-not $healthFunction -or $healthFunction.Extent.Text -notmatch "-ReconcileOnly") {
+            throw "Health-check entrypoint does not delegate to ReconcileOnly."
+        }
+        if ($healthFunction.Extent.Text -match "(?i)Get-SavedCredential|Start-Process|Stop-Process|Connect-Ras|rasdial\.exe") {
+            throw "Health-check entrypoint contains a forbidden credential, dial, or process-control operation."
+        }
+    }
+
+    Invoke-Check -Name "reconcile planner fixtures" -Script {
+        Invoke-ReconcilePlannerChecks
+    }
+
+    Invoke-Check -Name "atomic state replacement" -Script {
+        Invoke-AtomicStateChecks
     }
 
     Invoke-Check -Name "auto-connect ValidateOnly missing RasEntry" -Script {
@@ -283,7 +455,8 @@ try {
         $patterns = @(
             [pscustomobject]@{ Name = "OpenAI API key"; Regex = "sk-[A-Za-z0-9_-]{20,}" },
             [pscustomobject]@{ Name = "Proxy node URI"; Regex = ("(?i)(vme" + "s" + "s://|vle" + "s" + "s://|tro" + "jan://|hysteria" + "2://|s" + "s://)") },
-            [pscustomobject]@{ Name = "DPAPI password blob in JSON"; Regex = '(?i)"PasswordProtected"\s*:\s*"[A-Za-z0-9+/=]{40,}"' }
+            [pscustomobject]@{ Name = "DPAPI password blob in JSON"; Regex = '(?i)"PasswordProtected"\s*:\s*"[A-Za-z0-9+/=]{40,}"' },
+            [pscustomobject]@{ Name = "Full external IP curl field"; Regex = '%\{remote_ip\}' }
         )
         $hits = New-Object System.Collections.Generic.List[string]
         foreach ($file in $files) {
@@ -326,6 +499,14 @@ try {
                 }
                 if ($output -match "pre-clean stale Codex|connect RAS entry|NRPT before enter|routes before enter") {
                     throw ("Busy lock test reached a mutation stage. Output: {0}" -f $output.Trim())
+                }
+
+                $reconcileOutput = Invoke-NativeCapture -Script { & $PowerShellExe -NoProfile -ExecutionPolicy Bypass -File $enterScript -LockWaitSeconds 0 -ProbeMode Minimal -ReconcileOnly }
+                if ($LASTEXITCODE -ne 0 -or $reconcileOutput -notmatch "RECONCILE_SKIPPED_LOCK_BUSY") {
+                    throw ("Reconcile busy-lock test should skip successfully. Output: {0}" -f $reconcileOutput.Trim())
+                }
+                if ($reconcileOutput -match "Reconcile added|Reconcile removed|pre-clean stale Codex|connect RAS entry") {
+                    throw ("Reconcile busy-lock test reached a mutation stage. Output: {0}" -f $reconcileOutput.Trim())
                 }
             }
             finally {
